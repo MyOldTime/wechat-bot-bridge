@@ -1,0 +1,316 @@
+# wechat-bot-bridge
+
+`wechat-bot-bridge` 是一个使用 Python 3.12.13 与 uv 管理的微信 iLink Bot 本地桥接服务。自动化任务通过一个稳定的 HTTP 接口向我的微信发送通知；服务同时监听微信入站消息，将完整聊天记录保存到 SQLite，并在同源管理页面实时展示。
+
+> [!IMPORTANT]
+> 本项目接入的是微信 **iLink Bot**，不是桌面个人微信 Hook、注入或抓取工具。当前通道是扫码账号与 Bot 之间的一对一私聊，不能监听该账号的全部好友、普通微信群或其他私人会话。扫码账号必须先向 Bot 发一条消息，服务取得唯一 `owner` 的会话上下文后，外部系统才能主动通知。
+
+## 能力
+
+- 外部系统只有一个业务接口：`POST /api/v1/messages`。
+- 支持文字、图片、普通文件、开始输入和取消输入；每次 POST 都是独立消息。
+- 外部 API 使用 Bearer API Key，管理页面使用另一组 HTTP Basic Auth。
+- `/admin` 提供非前后端分离的服务端页面，可查看完整聊天内容并发送消息。
+- 首次授权直接在受 Basic Auth 保护的 `/admin` 页面扫码；容器不再需要一次性 `login` 命令。
+- 管理页面可退出微信；退出会停止旧轮询并清除授权文件、全部聊天/媒体、owner、游标、入站去重和出站审计，然后立即返回新的扫码界面。
+- 管理页面会随输入框键入自动同步“正在输入”，并由浏览器定时器和服务端租约双重兜底取消。
+- 页面消息支持右键桥接引用；引用关系保存在历史中，微信侧收到带有明确“桥接引用”标记的普通文本。
+- 微信发来的原生引用会保留标题与原文快照，在页面中以“微信原生引用”独立展示。
+- 微信入站图片和文件会通过内置 iLink 客户端下载、解密后落入 SQLite，并在管理页面以内嵌预览或受保护下载链接展示。
+- 外部消息、页面消息和微信入站消息通过 WebSocket 及时更新到页面。
+- `ChatHistorySink` 复用统一入站分发机制，将微信消息保存到 SQLite；可选 HMAC Webhook 仍可并行转发。
+- Docker Compose 保持单进程部署，并把数据库和微信授权文件映射到宿主机 `./data`。
+
+接口细节见 [HTTP API](docs/api.md)，设计和边界见 [架构文档](docs/architecture.md)。
+
+## 项目结构
+
+源码按职责分层，页面模板和静态资源也归入独立 Web 边界：
+
+```text
+src/wechat_bot_bridge/
+├── api/
+│   ├── external.py            # 外部唯一 POST 路由
+│   ├── health.py              # 最小健康检查
+│   ├── security.py            # Bearer 认证
+│   ├── errors.py              # HTTP 错误映射
+│   └── schemas.py             # 外部请求/响应模型
+├── application/
+│   ├── account.py             # 登录控制、退出与全量清理
+│   ├── messaging.py           # 同步发送编排
+│   ├── payloads.py            # 统一载荷校验
+│   ├── bridge_quotes.py       # 桥接引用快照与降级文本
+│   └── typing.py              # 管理页面输入状态租约
+├── bootstrap/
+│   ├── app.py                 # FastAPI 生命周期与依赖装配
+│   └── cli.py                 # serve
+├── core/
+│   ├── config.py              # WBB_* 配置
+│   └── logging.py             # 安全结构化日志
+├── domain/
+│   ├── models.py              # 领域模型
+│   ├── ports.py               # 可替换端口
+│   └── errors.py              # 稳定业务错误
+├── infrastructure/
+│   ├── inbound/
+│   │   ├── dispatcher.py      # 入站 Sink 扇出
+│   │   └── chat_history.py    # SQLite 聊天记录 Sink
+│   ├── persistence/
+│   │   ├── sqlite.py          # 事务与存取编排
+│   │   ├── schema.py          # Schema、迁移与启动恢复
+│   │   ├── records.py         # SQLite 行到领域模型的转换
+│   │   ├── cursor.py          # 版本化历史游标
+│   │   └── transactions.py    # 可取消安全事务边界
+│   ├── realtime/
+│   │   └── conversation.py    # WebSocket 进程内事件总线
+│   └── wechat/
+│       ├── gateway.py           # 授权与监听生命周期、领域错误映射
+│       ├── inbound.py           # owner 校验、规范化、去重与媒体处理
+│       ├── delivery.py          # 出站领域载荷映射
+│       ├── protocols.py         # 网关最小客户端契约
+│       ├── session.py           # 授权会话指纹
+│       └── ilink/
+│           ├── auth.py          # 二维码、配对码与授权文件
+│           ├── client.py        # 内置 iLink 高层客户端
+│           ├── transport.py     # HTTP 端点、认证头与脱敏错误
+│           ├── messages.py      # wire 消息构造与入站解析
+│           ├── models.py        # 私有协议模型
+│           ├── crypto.py        # AES-128-ECB
+│           ├── media.py         # CDN 上传、流式下载与解密
+│           ├── constants.py
+│           └── errors.py
+└── web/
+    ├── router.py               # 管理路由装配
+    ├── routes/
+    │   ├── page.py             # HTML 页面
+    │   ├── account.py          # 登录、状态与退出
+    │   ├── messages.py         # 历史、媒体与发送
+    │   └── realtime.py         # WebSocket 事件
+    ├── schemas.py
+    ├── security.py             # Basic Auth 与短期页面令牌
+    ├── qr.py                   # 二维码 SVG 渲染
+    ├── templates/
+    │   └── chat.html
+    └── static/
+        ├── chat.css
+        └── chat.js
+```
+
+包目录使用 Python 3.12 隐式命名空间，不保留无行为的 `__init__.py`。依赖方向是 `api/web/bootstrap -> application -> domain <- infrastructure`；iLink 原始字典和授权细节不会扩散到路由或领域层。项目不再依赖 `wechatbot-sdk`，协议实现和兼容依据见 [iLink 协议实现说明](docs/ilink-protocol.md)。
+
+## Docker Compose 快速开始
+
+要求 Docker Engine 与 Docker Compose v2。
+
+```bash
+cp .env.example .env
+mkdir -p data/wechat
+```
+
+PowerShell：
+
+```powershell
+Copy-Item .env.example .env
+New-Item -ItemType Directory -Force data/wechat
+```
+
+编辑 `.env`，必须替换以下两个示例值，而且不要复用同一个密钥：
+
+```dotenv
+WBB_API_KEY=<外部系统使用的高熵随机值，至少 16 字符>
+WBB_WEB_PASSWORD=<管理页面使用的不同密码，至少 12 字符>
+```
+
+Linux 宿主机还需让容器内的非 root 用户（UID/GID `10001`）可写数据目录：
+
+```bash
+sudo chown -R 10001:10001 ./data
+chmod 700 ./data ./data/wechat
+```
+
+构建并启动服务：
+
+```bash
+docker compose up -d --build
+docker compose ps
+curl http://127.0.0.1:8000/health/live
+```
+
+打开 [http://127.0.0.1:8000/admin](http://127.0.0.1:8000/admin)，输入 `.env` 中的 `WBB_WEB_USERNAME` / `WBB_WEB_PASSWORD`。没有授权文件时，页面会自动申请并展示微信二维码；扫码并在微信确认即可。若微信要求配对数字，直接在同一页面填写。
+
+授权成功后，文件会写到容器 `/data/wechat/credentials.json`，通过 Compose 映射后可在宿主机看到：
+
+```text
+./data/
+├── wechat-bridge.db
+└── wechat/
+    └── credentials.json
+```
+
+`credentials.json` 含明文敏感授权材料。限制目录权限、保护备份、不要提交 Git，也不要把文件内容发到日志、聊天或工单。
+
+随后使用完成扫码的同一微信账号向 Bot 发一条消息。登录只证明账号已授权，并不会自动产生主动发送所需的聊天上下文；这条入站消息会建立唯一 `owner`。在登录和 owner 建立前，`/health/ready` 返回 `503` 是预期行为；连接完成后可再次执行 `curl http://127.0.0.1:8000/health/ready`。
+
+## 使用外部通知接口
+
+文字通知：
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/messages \
+  -H "Authorization: Bearer <WBB_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{"type":"text","text":"自动化任务已完成"}'
+```
+
+图片：
+
+```bash
+IMAGE_BASE64="$(base64 < result.png | tr -d '\n')"
+curl -X POST http://127.0.0.1:8000/api/v1/messages \
+  -H "Authorization: Bearer <WBB_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d "{\"type\":\"image\",\"content_base64\":\"${IMAGE_BASE64}\",\"caption\":\"任务截图\"}"
+```
+
+请求类型：
+
+- `text`：`{"type":"text","text":"..."}`
+- `image`：`{"type":"image","content_base64":"...","caption":"..."}`
+- `file`：`{"type":"file","content_base64":"...","file_name":"report.pdf","caption":"..."}`
+- `typing_start`：`{"type":"typing_start"}`
+- `typing_cancel`：`{"type":"typing_cancel"}`
+
+目标固定为唯一 `owner`，接口不接受 `recipient`、`user_id`、alias 或请求体幂等键。发送在当前 HTTP 请求内同步完成：iLink 接受后返回 `200` 和 `status=sent`；失败直接返回稳定 `4xx/5xx`。`200` 不是接收端已读回执。
+
+外部 API 不再提供列表或按 ID 查询：
+
+- `GET /api/v1/messages` 已移除；
+- `GET /api/v1/messages/{message_id}` 已移除；
+- `/recipients` 和外部微信状态接口也不存在。
+
+每次 POST 都代表一条新消息。即使正文或遗留的 `Idempotency-Key` 请求头相同，也不会去重。网络超时后重试可能产生重复通知，只有业务允许重复时才自动重试。
+
+## 使用管理页面
+
+打开 [http://127.0.0.1:8000/admin](http://127.0.0.1:8000/admin)，浏览器会请求 Basic Auth：
+
+- 用户名：`WBB_WEB_USERNAME`，默认 `admin`
+- 密码：`WBB_WEB_PASSWORD`
+
+页面可以：
+
+- 在首次启动、授权过期或退出后展示二维码，并在需要时提交微信配对数字；
+- 查看 SQLite 中保存的完整文字、图片和文件消息；微信入站图片可点开原图，文件可下载；
+- 区分微信入站、外部任务和管理页面发送来源；
+- 展示 `sending`、`sent`、`failed`、`received` 状态；
+- 直接发送文字、图片或文件；
+- 在输入框键入时自动向微信同步“正在输入”，停止输入后自动取消；
+- 右键任意消息建立桥接引用，发送后在本地历史中保留关联；微信发来的原生引用则按原生引用快照展示；
+- 通过 WebSocket 接收实时更新，断线后自动重连，并可通过历史接口恢复。
+- 通过原生 HTML 表单退出登录；该请求同时要求 Basic Auth 和短期页面令牌，成功后清除全部本地账号数据并回到扫码界面。
+
+腾讯公开的共享 `MessageItem` 类型包含 `ref_msg`，但官方 `sendmessage` 能力和发送实现没有提供 Bot 出站原生引用；本项目在 2026-07-29 使用真实微信验证时，上游接受含 `ref_msg` 的请求却只投递正文，引用被静默忽略。因此右键引用仍是项目自己的“桥接引用”：页面展示结构化引用，发往微信的内容会明确加上 `【桥接引用·对方】` 或 `【桥接引用·我】` 前缀，不会伪装成微信原生引用卡片。
+
+管理页面的 Basic 凭据与外部 Bearer API Key 相互独立。没有配置 `WBB_WEB_PASSWORD` 时，`/admin` 返回 `503 web_admin_disabled`。生产环境跨主机访问时必须放在 HTTPS 反向代理或私有网络后，不要把 Basic Auth 明文暴露在不可信网络。
+
+退出是不可撤销的本地清理操作：SQLite 五张业务表中的聊天、媒体、owner、cursor、去重和审计记录都会删除，`credentials.json` 也会删除。页面会广播账号重置事件，使其他已打开的管理页面丢弃旧视图；宿主机映射的数据库文件和目录本身会保留，以便立即重新登录。
+
+## 微信入站与统一处理
+
+内置客户端通过 `getupdates` 收到消息后，先解析为私有模型，再校验发送者是扫码账号、更新 `owner` 上下文、规范化正文和原生引用并持久去重。解析器不会人为生成 `[image]` 等媒体占位符或把图片 URL 拼入正文；图片、文件、语音或视频在超时和流式大小限制内从 CDN 下载并使用 AES-128-ECB 解密。成功下载的字节只交给聊天历史，不进入 Webhook 信封。`InboundDispatcher` 按顺序调用：
+
+1. `ChatHistorySink`：写入 `chat_messages` 并广播 WebSocket；
+2. `LoggingSink`：只记录脱敏元数据；
+3. 可选 `WebhookSink`：使用独立密钥签名转发。
+
+配置 Webhook：
+
+```dotenv
+WBB_INBOUND_WEBHOOK_URL=https://example.internal/hooks/wechat
+WBB_INBOUND_WEBHOOK_SECRET=<另一个高熵随机值>
+```
+
+当前 Webhook 是有界进程内队列和有限重试，不是重启可续投的持久队列。需要强可靠消费时，下游应快速落盘并按 `event_id` 去重。
+
+## 本地开发
+
+```bash
+uv python install 3.12.13
+uv sync --frozen
+uv run wechat-bot-bridge serve
+```
+
+然后访问 `/admin` 完成扫码。CLI 只保留 `serve`，避免交互式终端授权与常驻容器争用同一凭据和长轮询。
+
+项目的 uv 索引默认配置为阿里云 PyPI 镜像，也可显式覆盖：
+
+```powershell
+$env:UV_DEFAULT_INDEX = "https://mirrors.aliyun.com/pypi/simple/"
+uv sync --frozen
+```
+
+验证：
+
+```bash
+uv run pytest
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy src
+uv build
+```
+
+## 配置
+
+| 变量 | Docker 默认值 | 说明 |
+| --- | --- | --- |
+| `WBB_API_KEY` | 必填 | 外部 `POST /api/v1/messages` 的 Bearer Key，至少 16 字符 |
+| `WBB_WEB_USERNAME` | `admin` | 管理页面 Basic Auth 用户名 |
+| `WBB_WEB_PASSWORD` | 未设置 | 管理页面独立密码；未设置时页面关闭，至少 12 字符 |
+| `WBB_WEB_TOKEN_TTL_SECONDS` | `3600` | 页面写操作和 WebSocket 短期令牌有效期 |
+| `WBB_WEB_TYPING_TIMEOUT_SECONDS` | `5` | 页面输入状态服务端租约秒数，超时后自动取消 |
+| `WBB_HOST` | `0.0.0.0` | 容器内监听地址 |
+| `WBB_PORT` | `8000` | 容器内监听端口 |
+| `WBB_LOG_LEVEL` | `info` | 日志级别 |
+| `WBB_DATA_DIR` | `/data` | 持久化根目录 |
+| `WBB_DATABASE_PATH` | `/data/wechat-bridge.db` | SQLite 路径 |
+| `WBB_CREDENTIALS_PATH` | `/data/wechat/credentials.json` | 明文 iLink 授权文件 |
+| `WBB_INBOUND_WEBHOOK_URL` | 未设置 | 可选入站转发地址 |
+| `WBB_INBOUND_WEBHOOK_SECRET` | 未设置 | Webhook HMAC 密钥 |
+| `WBB_INBOUND_QUEUE_SIZE` | `1000` | 入站分发队列容量 |
+| `WBB_INBOUND_MEDIA_DOWNLOAD_TIMEOUT_SECONDS` | `30` | 微信入站媒体单次下载超时秒数 |
+| `WBB_WEBHOOK_TIMEOUT_SECONDS` | `8` | 单次 Webhook 超时 |
+| `WBB_WEBHOOK_MAX_ATTEMPTS` | `3` | Webhook 最大尝试次数 |
+| `WBB_MESSAGE_MAX_CHARS` | `16000` | 单条文本最大字符数 |
+| `WBB_MEDIA_MAX_BYTES` | `20971520` | 解码后媒体上限，绝对上限 25 MiB |
+| `WBB_HOST_PORT` | `8000` | Compose 宿主机回环端口 |
+| `UV_DEFAULT_INDEX` | 阿里云镜像 | uv/PyPI 索引 |
+
+保持单进程、单 Uvicorn worker和单 iLink 长轮询消费者。横向扩容前必须先实现 poller 租约、共享队列和支持并发协调的存储。
+
+应用日志使用统一格式，并在末尾附加白名单 JSON `context`，例如消息 ID、
+类型、状态、错误码和重试次数。聊天正文、owner 标识、授权 token、
+`context_token`、二维码内容和带查询参数的 URL 不会进入普通日志。
+`WBB_LOG_LEVEL` 可设置为 `critical`、`error`、`warning`、`info`、`debug`
+或 `trace`。
+
+## 上游限制与排障
+
+- 只有扫码账号能成为当前通道的唯一 `owner`，服务不提供联系人列表。
+- 社区反馈主动发送通常受最近一次用户入站消息起约 24 小时的互动窗口约束，窗口内仍可能限频。
+- `/ilink/bot/sendmessage failed (ret=-2)` 可能是上下文过期，也可能是限频，不能仅凭返回码认定唯一原因。
+- 发生失败时停止密集重试，让 owner 重新向 Bot 发一条消息并降低频率。
+- 当前内置客户端只对文字、图片、文件和出站输入状态完成了稳定建模，因此外部 API 不开放原生语音、视频或引用发送；管理页面的引用是带明确标记的桥接文本。
+- iLink 只提供 Bot 向微信发送/取消输入状态的 `sendtyping`，`getupdates` 不包含微信用户的输入状态，因此微信端“正在输入”不能反向同步到网页。
+
+协议来源：[腾讯 openclaw-weixin](https://github.com/Tencent/openclaw-weixin)、[Python 参考实现](https://github.com/corespeed-io/wechatbot/tree/main/python)。社区限制讨论：[互动窗口 #76](https://github.com/corespeed-io/wechatbot/issues/76)、[限频 #80](https://github.com/corespeed-io/wechatbot/issues/80)、[个人微信群 #53](https://github.com/corespeed-io/wechatbot/issues/53)。
+
+## 常用运维命令
+
+```bash
+docker compose logs -f wechat-bot-bridge
+docker compose build --pull
+docker compose up -d
+docker compose down
+```
+
+`docker compose down` 不会删除宿主机 `./data`。升级前应备份该目录，并按密钥材料的级别保护备份。

@@ -1,0 +1,40 @@
+services:
+  wechat-bot-bridge:
+    image: wechat-bot-bridge:local
+    build:
+      context: .
+      args:
+        UV_DEFAULT_INDEX: ${UV_DEFAULT_INDEX:-https://mirrors.aliyun.com/pypi/simple/}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      WBB_HOST: "0.0.0.0"
+      WBB_PORT: "8000"
+      WBB_DATA_DIR: "/data"
+      WBB_DATABASE_PATH: "/data/wechat-bridge.db"
+      # 明文授权材料会持久化到宿主机以下位置：
+      # ./data/wechat/credentials.json
+      WBB_CREDENTIALS_PATH: "/data/wechat/credentials.json"
+      WEB_CONCURRENCY: "1"
+    ports:
+      - "127.0.0.1:${WBB_HOST_PORT:-8000}:8000"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3).read()"
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

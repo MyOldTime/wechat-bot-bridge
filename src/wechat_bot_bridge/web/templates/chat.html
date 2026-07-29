@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light">
+    <meta name="admin-token" content="{{ admin_token }}">
+    <meta name="message-max-chars" content="{{ message_max_chars }}">
+    <meta name="media-max-bytes" content="{{ media_max_bytes }}">
+    <meta name="typing-timeout-seconds" content="{{ typing_timeout_seconds }}">
+    <title>微信 Bot 对话 · wechat-bot-bridge</title>
+    <link rel="stylesheet" href="/admin/static/chat.css?v=7">
+    <script src="/admin/static/chat.js?v=7" defer></script>
+  </head>
+  <body>
+    <main class="app-shell">
+      <aside class="sidebar" aria-label="会话列表">
+        <div class="brand">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span>
+            <span></span>
+          </div>
+          <div>
+            <strong>微信桥接</strong>
+            <small>wechat-bot-bridge</small>
+          </div>
+        </div>
+
+        <div class="sidebar-label">当前会话</div>
+        <button class="conversation-card active" type="button">
+          <span class="avatar owner-avatar" aria-hidden="true">我</span>
+          <span class="conversation-copy">
+            <span class="conversation-title">我的微信 Bot</span>
+            <span id="conversation-preview" class="conversation-preview">正在加载消息…</span>
+          </span>
+          <span id="conversation-time" class="conversation-time"></span>
+        </button>
+
+        <div class="sidebar-footer">
+          <span class="avatar admin-avatar" aria-hidden="true">{{ web_username[:1] | upper }}</span>
+          <span>
+            <strong>{{ web_username }}</strong>
+            <small>管理页面</small>
+          </span>
+        </div>
+      </aside>
+
+      <section class="chat-panel" aria-label="微信 Bot 对话">
+        <section id="login-panel" class="login-panel" aria-labelledby="login-title" hidden>
+          <div class="login-card">
+            <div class="login-mark" aria-hidden="true">
+              <span></span>
+              <span></span>
+            </div>
+            <p class="login-kicker">WECHAT ILINK BOT</p>
+            <h1 id="login-title">连接我的微信</h1>
+            <p id="login-description" class="login-description">
+              正在检查授权状态…
+            </p>
+
+            <div id="qr-frame" class="qr-frame" hidden>
+              <img id="login-qr" alt="微信登录二维码">
+            </div>
+            <div id="login-progress" class="login-progress">
+              <span class="login-spinner" aria-hidden="true"></span>
+              <span id="login-progress-label">准备登录界面</span>
+            </div>
+
+            <form id="verification-form" class="verification-form" hidden>
+              <label for="verification-code">微信显示的配对数字</label>
+              <div>
+                <input
+                  id="verification-code"
+                  name="verification_code"
+                  type="text"
+                  inputmode="numeric"
+                  pattern="[0-9]+"
+                  maxlength="32"
+                  autocomplete="one-time-code"
+                  required
+                >
+                <button type="submit">确认</button>
+              </div>
+            </form>
+
+            <button id="start-login-button" class="start-login-button" type="button" hidden>
+              重新生成二维码
+            </button>
+            <p class="login-note">
+              页面已受 HTTP Basic Auth 保护。二维码和配对数字不会写入日志。
+            </p>
+            <form
+              id="login-reset-form"
+              class="login-reset-form"
+              action="/admin/logout"
+              method="post"
+              hidden
+            >
+              <input type="hidden" name="admin_token" value="{{ admin_token }}">
+              <button type="submit">清除本地状态并重新登录</button>
+            </form>
+          </div>
+        </section>
+
+        <header class="chat-header">
+          <div class="header-identity">
+            <span class="avatar owner-avatar compact" aria-hidden="true">微</span>
+            <div>
+              <h1>我的微信 Bot</h1>
+              <div class="connection-line">
+                <span id="connection-dot" class="connection-dot"></span>
+                <span id="connection-label">正在连接服务…</span>
+              </div>
+            </div>
+          </div>
+          <div class="header-actions">
+            <span id="gateway-badge" class="gateway-badge">状态检测中</span>
+            <form
+              id="logout-form"
+              class="logout-form"
+              action="/admin/logout"
+              method="post"
+            >
+              <input type="hidden" name="admin_token" value="{{ admin_token }}">
+              <button type="submit" title="退出微信并清除全部本地数据">退出登录</button>
+            </form>
+            <button id="refresh-button" class="icon-button" type="button" title="刷新消息" aria-label="刷新消息">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 11a8 8 0 1 0-2.34 5.66M20 4v7h-7"></path>
+              </svg>
+            </button>
+          </div>
+        </header>
+
+        <div id="message-scroll" class="message-scroll">
+          <button id="load-older" class="load-older" type="button" hidden>加载更早消息</button>
+          <div id="empty-state" class="empty-state" hidden>
+            <div class="empty-icon" aria-hidden="true">💬</div>
+            <h2>还没有聊天记录</h2>
+            <p>从这里发送第一条消息，或等待微信消息进入。</p>
+          </div>
+          <div id="message-list" class="message-list" role="log" aria-live="polite"></div>
+          <div id="typing-indicator" class="typing-indicator" hidden>
+            <span></span><span></span><span></span>
+            <em>正在输入</em>
+          </div>
+        </div>
+
+        <form id="composer" class="composer">
+          <div id="quote-preview" class="quote-preview" hidden>
+            <div class="quote-preview-mark" aria-hidden="true">↩</div>
+            <div class="quote-preview-copy">
+              <strong id="quote-preview-title">桥接引用消息</strong>
+              <span id="quote-preview-text"></span>
+            </div>
+            <button id="remove-quote" type="button" aria-label="取消引用">×</button>
+          </div>
+
+          <div id="attachment-preview" class="attachment-preview" hidden>
+            <div class="attachment-icon" aria-hidden="true">📎</div>
+            <div>
+              <strong id="attachment-name"></strong>
+              <small id="attachment-size"></small>
+            </div>
+            <button id="remove-attachment" type="button" aria-label="移除附件">×</button>
+          </div>
+
+          <textarea
+            id="message-input"
+            rows="3"
+            maxlength="{{ message_max_chars }}"
+            placeholder="输入消息，Enter 发送，Shift + Enter 换行"
+            aria-label="消息内容"
+          ></textarea>
+
+          <div class="composer-toolbar">
+            <div class="tool-group">
+              <label class="tool-button" for="attachment-input" title="发送图片或文件">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="m21.4 11.6-8.9 8.9a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"></path>
+                </svg>
+                <span>附件</span>
+              </label>
+              <input id="attachment-input" type="file" hidden>
+              <span id="character-count" class="character-count">0 / {{ message_max_chars }}</span>
+              <span class="quote-hint">右键消息可桥接引用</span>
+            </div>
+            <button id="send-button" class="send-button" type="submit" disabled>
+              <span>发送</span>
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="m22 2-7 20-4-9-9-4Z"></path>
+                <path d="M22 2 11 13"></path>
+              </svg>
+            </button>
+          </div>
+        </form>
+      </section>
+    </main>
+
+    <div id="message-context-menu" class="message-context-menu" role="menu" hidden>
+      <button id="quote-message-action" type="button" role="menuitem">
+        <span aria-hidden="true">↩</span>
+        桥接引用此消息
+      </button>
+    </div>
+    <div id="toast-region" class="toast-region" aria-live="assertive"></div>
+  </body>
+</html>
