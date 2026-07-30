@@ -34,8 +34,9 @@ class FakeTransport:
         self,
         _credentials: Credentials,
         message: dict[str, Any],
-    ) -> None:
+    ) -> str:
         self.sent.append(message)
+        return f"server-message-{len(self.sent)}"
 
     async def get_config(
         self,
@@ -119,7 +120,8 @@ async def test_client_sends_caption_and_image_as_protocol_items() -> None:
         media_max_bytes=1024,
     )
 
-    await client.send_image(
+    server_message_id = await client.send_image(
+        message_id="local-image",
         user_id="owner",
         context_token="private-context",
         data=b"image-bytes",
@@ -128,11 +130,20 @@ async def test_client_sends_caption_and_image_as_protocol_items() -> None:
 
     assert transport.upload_types == [UploadMediaType.IMAGE]
     assert len(transport.sent) == 2
-    assert transport.sent[0]["item_list"] == [{"type": 1, "text_item": {"text": "任务截图"}}]
+    assert transport.sent[0]["client_id"] == "local-image:caption"
+    assert transport.sent[0]["item_list"] == [
+        {
+            "type": 1,
+            "text_item": {"text": "任务截图"},
+        }
+    ]
     image_item = transport.sent[1]["item_list"][0]
+    assert transport.sent[1]["client_id"] == "local-image"
+    assert "msg_id" not in image_item
     assert image_item["type"] == 2
     assert image_item["image_item"]["media"]["encrypt_query_param"] == "download-reference"
     assert image_item["image_item"]["media"]["aes_key"]
+    assert server_message_id == "server-message-2"
 
 
 async def test_client_sends_file_typing_updates_and_lifecycle_notifications() -> None:
@@ -143,7 +154,8 @@ async def test_client_sends_file_typing_updates_and_lifecycle_notifications() ->
         media_max_bytes=1024,
     )
 
-    await client.send_file(
+    server_message_id = await client.send_file(
+        message_id="local-file",
         user_id="owner",
         context_token="private-context",
         data=b"pdf",
@@ -166,8 +178,11 @@ async def test_client_sends_file_typing_updates_and_lifecycle_notifications() ->
 
     assert transport.upload_types == [UploadMediaType.FILE]
     file_item = transport.sent[0]["item_list"][0]["file_item"]
+    assert transport.sent[0]["client_id"] == "local-file"
+    assert "msg_id" not in transport.sent[0]["item_list"][0]
     assert file_item["file_name"] == "report.pdf"
     assert file_item["len"] == "3"
     assert transport.typing == [TypingStatus.TYPING, TypingStatus.CANCEL]
     assert transport.notifications == ["start", "stop"]
     assert updates.cursor == "cursor-next"
+    assert server_message_id == "server-message-1"

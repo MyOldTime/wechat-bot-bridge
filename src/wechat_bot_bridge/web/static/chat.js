@@ -24,16 +24,10 @@
     loadOlder: document.querySelector("#load-older"),
     logoutForm: document.querySelector("#logout-form"),
     messageInput: document.querySelector("#message-input"),
-    messageContextMenu: document.querySelector("#message-context-menu"),
     messageList: document.querySelector("#message-list"),
     messageScroll: document.querySelector("#message-scroll"),
-    quoteMessageAction: document.querySelector("#quote-message-action"),
-    quotePreview: document.querySelector("#quote-preview"),
-    quotePreviewText: document.querySelector("#quote-preview-text"),
-    quotePreviewTitle: document.querySelector("#quote-preview-title"),
     refreshButton: document.querySelector("#refresh-button"),
     removeAttachment: document.querySelector("#remove-attachment"),
-    removeQuote: document.querySelector("#remove-quote"),
     sendButton: document.querySelector("#send-button"),
     startLoginButton: document.querySelector("#start-login-button"),
     toastRegion: document.querySelector("#toast-region"),
@@ -61,8 +55,6 @@
   const messages = new Map();
   let nextCursor = null;
   let selectedFile = null;
-  let quotedMessage = null;
-  let contextMenuMessage = null;
   let websocket = null;
   let reconnectTimer = null;
   let reconnectAttempts = 0;
@@ -159,12 +151,6 @@
     const prefix = message.type === "text" ? "" : `[${messageTypeLabel(message.type)}] `;
     const summary = `${prefix}${text}`.trim() || `[${messageTypeLabel(message.type)}]`;
     return summary.length > 120 ? `${summary.slice(0, 119)}…` : summary;
-  }
-
-  function speakerLabel(direction) {
-    if (direction === "inbound") return "对方";
-    if (direction === "outbound") return "我";
-    return "微信";
   }
 
   function showToast(message, type = "normal") {
@@ -305,26 +291,24 @@
 
   function prependQuoteBlock(bubble, message) {
     if (!message.quote) return;
-    const canNavigate = Boolean(message.quote.id);
-    const quoted = document.createElement(canNavigate ? "button" : "div");
-    if (canNavigate) quoted.type = "button";
-    quoted.className = "message-quote";
-    quoted.classList.toggle("static", !canNavigate);
-    if (canNavigate) {
-      quoted.dataset.quoteTarget = message.quote.id;
-      quoted.title = "定位到被引用的消息";
+    const canLocate = Boolean(message.quote.message_id);
+    const quoted = document.createElement(canLocate ? "button" : "div");
+    if (canLocate) {
+      quoted.type = "button";
+      quoted.title = "定位到被引用的原文";
     }
+    quoted.className = "message-quote";
     const title = document.createElement("strong");
     title.textContent = message.quote.title
       ? `微信原生引用 · ${message.quote.title}`
-      : message.quote.direction
-        ? `桥接引用 ${speakerLabel(message.quote.direction)} 的消息`
-        : "微信原生引用";
+      : "微信原生引用";
     const content = document.createElement("span");
     content.append(escapeText(quoteSummary(message.quote)));
     quoted.append(title, content);
-    if (canNavigate) {
-      quoted.addEventListener("click", () => focusQuotedMessage(message.quote.id));
+    if (canLocate) {
+      quoted.addEventListener("click", () => {
+        focusQuotedMessage(message.quote.message_id);
+      });
     }
     bubble.prepend(quoted);
   }
@@ -334,12 +318,14 @@
       `[data-message-id="${CSS.escape(messageId)}"]`,
     );
     if (!target) {
-      showToast("被引用的消息不在当前加载范围，请先加载更早消息");
+      showToast("被引用的原文不在当前已加载记录中");
       return;
     }
     target.scrollIntoView({ behavior: "smooth", block: "center" });
     target.classList.remove("quote-target");
-    window.requestAnimationFrame(() => target.classList.add("quote-target"));
+    // 强制浏览器提交一次样式，使连续点击也能重新播放两次高亮动画。
+    void target.offsetWidth;
+    target.classList.add("quote-target");
     window.setTimeout(() => target.classList.remove("quote-target"), 1200);
   }
 
@@ -494,10 +480,8 @@
     nextCursor = null;
     historyLoaded = false;
     selectedFile = null;
-    quotedMessage = null;
     elements.attachmentInput.value = "";
     elements.attachmentPreview.hidden = true;
-    elements.quotePreview.hidden = true;
     elements.loadOlder.hidden = true;
     elements.typingIndicator.hidden = true;
     stopTypingStatus({ notifyServer: false });
@@ -666,7 +650,7 @@
     websocket.addEventListener("error", () => websocket.close());
   }
 
-  // 附件、桥接引用和输入状态。
+  // 附件和输入状态。
   function fileToBase64(file) {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -684,40 +668,6 @@
     elements.attachmentInput.value = "";
     elements.attachmentPreview.hidden = true;
     updateComposer();
-  }
-
-  function selectQuote(message) {
-    quotedMessage = message;
-    elements.quotePreviewTitle.textContent =
-      `桥接引用${speakerLabel(message.direction)}的${messageTypeLabel(message.type)}消息 · 微信端为文本`;
-    elements.quotePreviewText.textContent = quoteSummary(message);
-    elements.quotePreview.hidden = false;
-    closeContextMenu();
-    elements.messageInput.focus();
-  }
-
-  function clearQuote() {
-    quotedMessage = null;
-    elements.quotePreview.hidden = true;
-    elements.quotePreviewTitle.textContent = "桥接引用消息";
-    elements.quotePreviewText.textContent = "";
-  }
-
-  function closeContextMenu() {
-    contextMenuMessage = null;
-    elements.messageContextMenu.hidden = true;
-  }
-
-  function openContextMenu(event, message) {
-    contextMenuMessage = message;
-    elements.messageContextMenu.hidden = false;
-    const menuWidth = elements.messageContextMenu.offsetWidth;
-    const menuHeight = elements.messageContextMenu.offsetHeight;
-    elements.messageContextMenu.style.left =
-      `${Math.max(8, Math.min(event.clientX, window.innerWidth - menuWidth - 8))}px`;
-    elements.messageContextMenu.style.top =
-      `${Math.max(8, Math.min(event.clientY, window.innerHeight - menuHeight - 8))}px`;
-    elements.quoteMessageAction.focus();
   }
 
   function enqueueTypingAction(type) {
@@ -813,7 +763,6 @@
       } else {
         body = { type: "text", text };
       }
-      if (quotedMessage) body.quote_message_id = quotedMessage.id;
       // 等待尚在途中的 typing_start 完成，确保随后正文请求的服务端取消不会被旧请求反向覆盖。
       await typingQueue;
       await requestJson("/admin/api/messages", {
@@ -826,7 +775,6 @@
       });
       elements.messageInput.value = "";
       clearAttachment();
-      clearQuote();
     } catch (error) {
       showToast(error.message, "error");
     } finally {
@@ -847,33 +795,6 @@
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       elements.composer.requestSubmit();
-    } else if (event.key === "Escape" && quotedMessage) {
-      clearQuote();
-    }
-  });
-  elements.messageList.addEventListener("contextmenu", (event) => {
-    const target = event.target;
-    if (!(target instanceof Element)) return;
-    const row = target.closest(".message-row");
-    if (!row) return;
-    const message = messages.get(row.dataset.messageId);
-    if (!message) return;
-    event.preventDefault();
-    openContextMenu(event, message);
-  });
-  elements.quoteMessageAction.addEventListener("click", () => {
-    if (contextMenuMessage) selectQuote(contextMenuMessage);
-  });
-  elements.removeQuote.addEventListener("click", clearQuote);
-  elements.messageScroll.addEventListener("scroll", closeContextMenu);
-  window.addEventListener("resize", closeContextMenu);
-  document.addEventListener("click", (event) => {
-    if (!elements.messageContextMenu.contains(event.target)) closeContextMenu();
-  });
-  document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && !elements.messageContextMenu.hidden) {
-      closeContextMenu();
-      elements.messageInput.focus();
     }
   });
   elements.attachmentInput.addEventListener("change", () => {

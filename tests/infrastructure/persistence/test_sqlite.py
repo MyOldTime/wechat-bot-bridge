@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from wechat_bot_bridge.domain.errors import InvalidCursorError, QuotedMessageNotFoundError
+from wechat_bot_bridge.domain.errors import InvalidCursorError
 from wechat_bot_bridge.domain.models import (
     ConversationDirection,
     ConversationMessageType,
@@ -405,47 +405,23 @@ async def test_cursor_orders_equal_timestamps_by_message_id(tmp_path: Path) -> N
         await store.close()
 
 
-async def test_quote_relation_is_joined_as_a_non_recursive_snapshot(tmp_path: Path) -> None:
+async def test_legacy_bridge_quote_relation_is_not_returned(tmp_path: Path) -> None:
     store = await _open_store(tmp_path / "bridge.db")
     try:
-        original = await _begin_text(store, text="第一条")
-        quoted = await store.begin_outbound(
-            user_id="user-1",
-            message_type=OutboundMessageType.TEXT,
-            payload=TextPayload(text="引用回复"),
-            origin=MessageOrigin.WEB_ADMIN,
-            quote_message_id=original.id,
-        )
-
-        conversation = await store.get_conversation_message(quoted.id)
-        assert conversation is not None
-        assert conversation.text == "引用回复"
-        assert conversation.quote is not None
-        assert conversation.quote.id == original.id
-        assert conversation.quote.text == "第一条"
-        assert conversation.quote.direction is ConversationDirection.OUTBOUND
-    finally:
-        await store.close()
-
-
-async def test_missing_quote_rolls_back_outbound_transaction(tmp_path: Path) -> None:
-    store = await _open_store(tmp_path / "bridge.db")
-    try:
-        with pytest.raises(QuotedMessageNotFoundError):
-            await store.begin_outbound(
-                user_id="user-1",
-                message_type=OutboundMessageType.TEXT,
-                payload=TextPayload(text="不能写入"),
-                origin=MessageOrigin.WEB_ADMIN,
-                quote_message_id="missing-message",
-            )
-
         database = store._require_connection()
-        cursor = await database.execute("SELECT COUNT(*) AS count FROM outbound_messages")
-        row = await cursor.fetchone()
-        await cursor.close()
-        assert row is not None
-        assert int(row["count"]) == 0
+        await database.execute("ALTER TABLE chat_messages ADD COLUMN quote_message_id TEXT")
+        original = await _begin_text(store, text="旧版原消息")
+        reply = await _begin_text(store, text="旧版桥接引用回复")
+        await database.execute(
+            "UPDATE chat_messages SET quote_message_id = ? WHERE id = ?",
+            (original.id, reply.id),
+        )
+        await database.commit()
+
+        conversation = await store.get_conversation_message(reply.id)
+        assert conversation is not None
+        assert conversation.text == "旧版桥接引用回复"
+        assert conversation.quote is None
     finally:
         await store.close()
 
@@ -491,16 +467,92 @@ async def test_inbound_native_quote_snapshot_is_persisted_without_fake_target_id
         message = await store.record_inbound_conversation(event)
 
         assert message.quote is not None
-        assert message.quote.id is None
-        assert message.quote.direction is None
         assert message.quote.title == "微信桥接"
         assert message.quote.text == "瓷器"
         assert message.quote.message_type is ConversationMessageType.TEXT
+        assert message.quote.target_message_id is None
     finally:
         await store.close()
 
 
-async def test_legacy_chat_schema_adds_nullable_quote_column(tmp_path: Path) -> None:
+async def test_inbound_quote_item_id_recovers_original_text_and_target(
+    tmp_path: Path,
+) -> None:
+    store = await _open_store(tmp_path / "bridge.db")
+    original_time = utc_now()
+    original = InboundEvent(
+        event_id="original-message",
+        occurred_at=original_time,
+        sender=InboundSender(user_id="user-1"),
+        message=InboundMessageBody(type="text", text="测试"),
+        protocol_item_id="wx-item-original",
+    )
+    reply = InboundEvent(
+        event_id="quoted-reply",
+        occurred_at=original_time + timedelta(seconds=1),
+        sender=InboundSender(user_id="user-1"),
+        message=InboundMessageBody(type="text", text="11"),
+        protocol_item_id="wx-item-reply",
+        quote=InboundQuote(
+            title=None,
+            text="",
+            protocol_item_id="wx-item-original",
+        ),
+    )
+    try:
+        await store.record_inbound_conversation(original)
+        message = await store.record_inbound_conversation(reply)
+        page = await store.list_conversation_messages(cursor=None, limit=10)
+
+        assert message.quote is not None
+        assert message.quote.target_message_id == original.event_id
+        assert message.quote.message_type is ConversationMessageType.TEXT
+        assert message.quote.text == "测试"
+        assert page.items[-1].quote == message.quote
+    finally:
+        await store.close()
+
+
+async def test_inbound_quote_item_id_matches_original_top_level_message_id(
+    tmp_path: Path,
+) -> None:
+    """微信引用微信消息时，引用项 ID 可以指向原消息的顶层 message_id。"""
+
+    store = await _open_store(tmp_path / "bridge.db")
+    original_time = utc_now()
+    original = InboundEvent(
+        event_id="wechat-original",
+        occurred_at=original_time,
+        sender=InboundSender(user_id="user-1"),
+        message=InboundMessageBody(type="text", text="你好"),
+        protocol_item_id="original-current-item",
+        protocol_message_id="quoted-reference-id",
+    )
+    reply = InboundEvent(
+        event_id="wechat-reply",
+        occurred_at=original_time + timedelta(seconds=1),
+        sender=InboundSender(user_id="user-1"),
+        message=InboundMessageBody(type="text", text="测试引用"),
+        protocol_item_id="reply-current-item",
+        protocol_message_id="reply-top-level-message",
+        quote=InboundQuote(
+            title=None,
+            text="",
+            protocol_item_id="quoted-reference-id",
+        ),
+    )
+    try:
+        await store.record_inbound_conversation(original)
+        message = await store.record_inbound_conversation(reply)
+
+        assert message.quote is not None
+        assert message.quote.target_message_id == original.event_id
+        assert message.quote.text == "你好"
+    finally:
+        await store.close()
+
+
+async def test_legacy_chat_schema_adds_native_quote_snapshot_columns(tmp_path: Path) -> None:
     path = tmp_path / "legacy-chat.db"
     connection = sqlite3.connect(path)
     try:
@@ -533,11 +585,15 @@ async def test_legacy_chat_schema_adds_nullable_quote_column(tmp_path: Path) -> 
         columns = {str(row["name"]) for row in await cursor.fetchall()}
         await cursor.close()
         assert {
-            "quote_message_id",
+            "protocol_item_id",
+            "protocol_message_id",
             "native_quote_title",
             "native_quote_type",
             "native_quote_text",
+            "native_quote_target_id",
+            "native_quote_protocol_item_id",
         } <= columns
+        assert "quote_message_id" not in columns
     finally:
         await store.close()
 

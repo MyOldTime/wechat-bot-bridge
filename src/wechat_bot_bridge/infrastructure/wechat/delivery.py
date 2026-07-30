@@ -20,29 +20,32 @@ class OutboundClient(Protocol):
     async def send_text(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         text: str,
-    ) -> None: ...
+    ) -> str | None: ...
 
     async def send_image(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         data: bytes,
         caption: str | None,
-    ) -> None: ...
+    ) -> str | None: ...
 
     async def send_file(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         data: bytes,
         file_name: str,
         caption: str | None,
-    ) -> None: ...
+    ) -> str | None: ...
 
     async def set_typing(
         self,
@@ -56,48 +59,49 @@ class OutboundClient(Protocol):
 async def deliver_outbound_payload(
     client: OutboundClient,
     *,
+    message_id: str,
     user_id: str,
     context_token: str,
     payload: OutboundPayload,
-) -> None:
+) -> str | None:
     """穷举当前公开的领域载荷，并调用对应 iLink 能力。"""
 
     if isinstance(payload, TextPayload):
-        await client.send_text(
+        return await client.send_text(
+            message_id=message_id,
             user_id=user_id,
             context_token=context_token,
             text=payload.text,
         )
-        return
     if isinstance(payload, ImagePayload):
-        await client.send_image(
+        return await client.send_image(
+            message_id=message_id,
             user_id=user_id,
             context_token=context_token,
             data=payload.data,
             caption=payload.caption,
         )
-        return
     if isinstance(payload, FilePayload):
-        await client.send_file(
+        return await client.send_file(
+            message_id=message_id,
             user_id=user_id,
             context_token=context_token,
             data=payload.data,
             file_name=payload.file_name,
             caption=payload.caption,
         )
-        return
     if isinstance(payload, TypingStartPayload):
         await client.set_typing(
             user_id=user_id,
             context_token=context_token,
             active=True,
         )
-        return
+        return None
     if isinstance(payload, TypingCancelPayload):
         await client.set_typing(
             user_id=user_id,
             context_token=context_token,
             active=False,
         )
-        return
+        return None
     raise TypeError(f"Unsupported outbound payload: {type(payload).__name__}")

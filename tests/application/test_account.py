@@ -13,6 +13,7 @@ from wechat_bot_bridge.domain.models import (
     MessageOrigin,
     OutboundPayload,
     TextPayload,
+    WeChatDeliveryReceipt,
 )
 from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore
 from wechat_bot_bridge.infrastructure.realtime.conversation import (
@@ -62,15 +63,20 @@ class BlockingGateway:
     async def send_message(
         self,
         *,
+        message_id: str,
         user_id: str,
         payload: OutboundPayload,
         context_token: str,
-    ) -> None:
+    ) -> WeChatDeliveryReceipt:
         assert user_id == "owner-user"
         assert context_token == "private-context"
         assert isinstance(payload, TextPayload)
         self.send_started.set()
         await self.release_send.wait()
+        return WeChatDeliveryReceipt(
+            wechat_message_id=None,
+            protocol_item_id=None,
+        )
 
 
 async def test_logout_waits_for_inflight_send_then_clears_and_resets(

@@ -20,29 +20,32 @@ class GatewayClient(Protocol):
     async def send_text(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         text: str,
-    ) -> None: ...
+    ) -> str | None: ...
 
     async def send_image(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         data: bytes,
         caption: str | None,
-    ) -> None: ...
+    ) -> str | None: ...
 
     async def send_file(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         data: bytes,
         file_name: str,
         caption: str | None,
-    ) -> None: ...
+    ) -> str | None: ...
 
     async def set_typing(
         self,

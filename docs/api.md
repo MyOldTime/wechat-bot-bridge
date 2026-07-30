@@ -10,6 +10,9 @@ POST /api/v1/messages
 
 它供自动化任务、Hook 和其他程序同步向唯一微信 `owner` 发送消息。`/api/v1` 使用 Bearer API Key；管理页面 `/admin` 使用完全独立的 HTTP Basic Auth。健康检查和页面内部接口不会进入 OpenAPI，因此 `/openapi.json` 只列出上述一个操作。
 
+面向调用方的准备步骤、语言示例、错误处理和重试策略见
+[外部消息接口对接指南](external-api.md)。
+
 ## 2. 外部认证
 
 ```http
@@ -113,16 +116,32 @@ Content-Type: application/json
 ```json
 {
   "id": "9e4431a4-d3eb-449e-b027-1ba44f77884d",
+  "msg_id": "9223372036854000",
   "type": "text",
   "status": "sent",
-  "created_at": "2026-07-29T12:00:00.123456Z",
-  "sent_at": "2026-07-29T12:00:00.456789Z"
+  "created_at": "2026-07-30T12:00:00.123456Z",
+  "sent_at": "2026-07-30T12:00:00.456789Z"
 }
 ```
 
+`id` 是服务内部审计 ID；`msg_id` 是微信 `sendmessage` 实际响应的服务端消息
+ID。文字、图片和文件正常会返回字符串形式的 `msg_id`；输入状态没有聊天
+消息，因此为 `null`。原始 `msg_id` 只出现在本次受 Bearer 认证的同步响应，
+SQLite 仅保存账号隔离哈希，管理历史、Webhook 和普通日志都不会暴露它。
+
 服务只在 iLink 同步接受动作后返回 `200`；它不是客户端展示或已读回执。
 
-每次 POST 都会生成新的内部 ID。请求体不接受 `idempotency_key`，遗留 `Idempotency-Key` 请求头也不会触发去重。若调用方在响应到达前网络中断，再次 POST 可能产生重复通知；服务不会自动重试出站失败。
+每次 POST 都会生成新的内部 ID。请求体不接受 `idempotency_key`，
+`Idempotency-Key` 请求头不参与去重。若调用方在响应到达前网络中断，再次
+POST 可能产生重复通知；服务不会自动重试出站失败。
+
+### 出站引用边界
+
+请求不接受 `quote_msg_id`、`quote_message_id` 或 `ref_msg`。虽然成功响应
+返回的 `msg_id` 与微信入站引用里的 `MessageItem.msg_id` 相同，但它只能用于
+调用方记录和服务端识别微信后来发来的引用，不能让 Bot 主动发送原生引用。
+
+Bot 出站引用不属于当前公共契约，服务也不会用拼接文字模拟原生引用。
 
 ### 业务错误
 
@@ -148,9 +167,9 @@ Content-Type: application/json
 
 客户端应依据 HTTP 状态和稳定 `detail.code` 编程，不要匹配人类可读消息。上游 `ret=-2` 可能是互动上下文过期或限频，本服务不会把它误报为唯一原因。
 
-## 4. 已移除的外部接口
+## 4. 外部契约边界
 
-以下接口不存在：
+外部公开契约不包含以下路径：
 
 ```text
 GET /api/v1/messages
@@ -159,7 +178,7 @@ GET /api/v1/recipients
 GET /api/v1/wechat/status
 ```
 
-外部程序提交请求前并不知道内部消息 ID，单条查询没有稳定使用价值；旧列表又没有正文，无法承担会话管理。因此完整聊天记录归入独立认证的管理页面，而不是继续扩大外部 API。
+完整聊天记录、媒体和微信状态只通过独立认证的管理页面提供。
 
 ## 5. 管理页面
 
@@ -197,7 +216,7 @@ WBB_WEB_PASSWORD
 4. 扫码后若 `verification_required=true`，页面通过 `POST /admin/api/login/verification` 提交微信显示的纯数字配对码；
 5. 授权完成后状态变为 `listening`，授权文件原子写入映射的数据目录。
 
-已有有效授权文件时，常驻服务会直接恢复长轮询，管理页面无需再次扫码。授权过期后会删除失效凭据并回到 `login_required`，不会在无人访问管理页时把二维码打印到日志。
+存在有效授权文件时，常驻服务会直接启动长轮询，管理页面无需再次扫码。授权过期后会删除失效凭据并回到 `login_required`，二维码内容不会写入日志。
 
 ### 页面内部接口
 
@@ -219,17 +238,7 @@ WBB_WEB_PASSWORD
 
 退出按顺序停止当前授权/长轮询、等待已经入队的入站 Sink 全部结束、删除 `credentials.json`，再事务性删除 `chat_messages`、`inbound_events`、`outbound_messages`、`recipients` 和 `bridge_state`。随后服务广播 `account_reset`、启动一轮新扫码并重定向回管理页。发送与退出共用账号操作锁，因此清理期间不会插入新的出站消息。
 
-页面发送使用与外部接口相同的 `text`、`image`、`file`、`typing_start`、`typing_cancel` 判别类型。前三种可以额外携带管理端专用的引用 ID：
-
-```json
-{
-  "type": "text",
-  "text": "引用回复",
-  "quote_message_id": "wechat-message-id"
-}
-```
-
-引用目标不存在时返回 `404 quoted_message_not_found`。引用关系保存在 SQLite 和历史响应中，但腾讯当前公开发送能力没有经过验证且可用的 Bot 出站原生引用契约；真实微信会静默忽略出站 `ref_msg`。实际发往微信的是带 `【桥接引用·对方】` 或 `【桥接引用·我】` 前缀的普通文本，不能把它描述为原生引用卡片。外部 `POST /api/v1/messages` 不接受 `quote_message_id`。
+页面发送使用与外部接口相同的 `text`、`image`、`file`、`typing_start`、`typing_cancel` 判别类型。管理页面和外部接口均不接受 `quote_msg_id`、`quote_message_id` 或其他出站引用字段；多余字段按请求校验错误返回 `422`。
 
 前端监听非空输入框并发送 `typing_start`，每次继续输入都会刷新定时器；清空、停止输入、发送正文或超时都会取消。服务端另以 `WBB_WEB_TYPING_TIMEOUT_SECONDS`（默认 5 秒）维护租约，即使页面断开也会自动调用 `typing_cancel`。
 
@@ -250,18 +259,24 @@ WBB_WEB_PASSWORD
       "origin": "external_api",
       "error_code": null,
       "quote": null,
-      "occurred_at": "2026-07-29T12:00:00.123456Z",
-      "updated_at": "2026-07-29T12:00:00.456789Z"
+      "occurred_at": "2026-07-30T12:00:00.123456Z",
+      "updated_at": "2026-07-30T12:00:00.456789Z"
     }
   ],
   "next_cursor": null
 }
 ```
 
-`direction` 是 `inbound` 或 `outbound`；`origin` 是 `wechat`、`external_api` 或 `web_admin`。有引用时 `quote` 不会递归展开：
+`direction` 是 `inbound` 或 `outbound`；`origin` 是 `wechat`、`external_api` 或 `web_admin`。只有微信入站原生引用会让 `quote` 非空，其中包含 `message_id`、`title`、`type` 与原文 `text` 快照。服务用官方 `ref_msg.message_item.msg_id` 精确匹配入站顶层 `WeixinMessage.message_id`、入站 `MessageItem.msg_id` 或 Bot 出站主消息 ID；命中时返回管理端 `message_id`，并可用目标记录回填上游省略的原文。无法精确匹配时 `message_id` 为 `null`，不会按正文或时间猜测。普通消息和所有出站消息自身的 `quote` 都是 `null`，原始协议 message/item ID 不会出现在响应中。
 
-- 管理端桥接引用包含目标的 `id`、`direction`、`type`、`text`、`file_name`，`title` 为 `null`，可以定位到已加载的目标消息；
-- 微信原生引用没有稳定目标 ID，`id` 和 `direction` 为 `null`，包含内置解析器提供的 `title`、`type` 与原文 `text` 快照。
+```json
+{
+  "message_id": "f1c3a2...",
+  "title": null,
+  "type": "text",
+  "text": "被引用的原文"
+}
+```
 
 成功下载的微信入站图片或文件会提供 `media_url`；该链接仍要求同一 Basic Auth，图片以内联响应返回，带文件名的内容使用附件下载。内置解析器不生成 `[image]` / `[图片]` 占位符，也不会把图片 URL 作为说明重复展示。响应不包含 owner `user_id`、`context_token` 或授权材料。
 
@@ -321,7 +336,7 @@ WBB_WEB_PASSWORD
 }
 ```
 
-收到该事件后，客户端必须丢弃全部内存消息、附件、引用和分页游标，并以新的登录状态和历史接口为准。服务端会先清空每个订阅队列中的旧事件，避免退出前尚未消费的 `message_upsert` 在重置之后重新出现。
+收到该事件后，客户端必须丢弃全部内存消息、附件、引用和分页游标，并以新的登录状态和历史接口为准。服务端会先清空每个订阅队列中的待消费事件，避免退出前尚未消费的 `message_upsert` 在重置之后重新出现。
 
 服务器空闲约 25 秒会发送 `{"type":"ping"}`。进程内实时队列允许丢弃慢客户端的最旧事件，页面必须以 SQLite 历史接口作为恢复依据。
 
@@ -360,7 +375,7 @@ HMAC-SHA256(secret, timestamp + "." + raw_request_body)
   "schema_version": "1",
   "event_id": "f1c3a2...",
   "source": "wechat_ilink",
-  "occurred_at": "2026-07-29T12:00:00Z",
+  "occurred_at": "2026-07-30T12:00:00Z",
   "sender": {
     "user_id": "..."
   },
@@ -376,4 +391,4 @@ HMAC-SHA256(secret, timestamp + "." + raw_request_body)
 }
 ```
 
-没有微信原生引用时 `quote` 为 `null`。接收方应使用原始请求体和时间戳验证签名，限制时间偏差，恒定时间比较，并按 `event_id` 去重。credential token、`context_token`、完整 iLink 原始载荷和下载后的媒体字节不会进入 Webhook。媒体仍以 `message.type` 呈现，上游遗留占位符会从 `message.text` 清除；二进制只保存在受 Basic Auth 保护的聊天历史中。
+没有微信原生引用时 `quote` 为 `null`。Webhook 保留 iLink 当次提供的引用快照，不包含内部协议 item ID、管理端目标消息 ID 或仅在 SQLite 历史中完成的原文回填。接收方应使用原始请求体和时间戳验证签名，限制时间偏差，恒定时间比较，并按 `event_id` 去重。credential token、`context_token`、完整 iLink 原始载荷和下载后的媒体字节不会进入 Webhook。媒体仍以 `message.type` 呈现，iLink 媒体占位符会从 `message.text` 清除；二进制只保存在受 Basic Auth 保护的聊天历史中。

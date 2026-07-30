@@ -17,7 +17,7 @@
 ```text
 src/wechat_bot_bridge/
 ├── api/                        外部 POST、Bearer、健康检查、HTTP schema
-├── application/                账号生命周期、发送编排、载荷校验、桥接引用、输入租约
+├── application/                账号生命周期、发送编排、载荷校验、输入租约
 ├── bootstrap/                  FastAPI/CLI 装配与生命周期
 ├── core/                       WBB_* 配置
 ├── domain/                     模型、错误、端口
@@ -52,7 +52,7 @@ api/web/bootstrap -> application -> domain ports <- infrastructure adapters
 - `web/` 是单独的同源管理边界，不把管理数据塞回外部 API。
 - `web/router.py` 只负责装配；`web/routes/` 按页面、账号、消息和实时协议拆分。
 - `application/` 编排唯一 owner、同步发送、状态迁移和实时发布。
-- `application/payloads.py` 与 `bridge_quotes.py` 保存可独立测试的纯规则，发送用例只负责顺序和失败补偿。
+- `application/payloads.py` 保存可独立测试的纯规则，发送用例只负责顺序和失败补偿。
 - `bootstrap/` 是具体组件装配的唯一位置。
 - `infrastructure/persistence/` 将 schema/迁移、行映射、游标和事务编排分离，避免数据库兼容逻辑污染业务存取方法。
 - `infrastructure/wechat/ilink/` 是唯一接触 iLink 原始 JSON、认证头和 CDN 加密的位置。
@@ -126,7 +126,7 @@ sequenceDiagram
     G->>G: 中断二维码流程/长轮询
     G->>G: notify-stop + 清除内存会话
     G->>Q: drain()
-    Q-->>G: 旧入站 Sink 已完成
+    Q-->>G: 入站 Sink 已排空
     G->>G: 删除 credentials.json
     A->>D: clear_all()
     D->>D: 事务 DELETE + WAL 截断 + VACUUM
@@ -135,7 +135,7 @@ sequenceDiagram
     A-->>B: 303 /admin
 ```
 
-先停生产者、再排空消费者、最后清库是关键顺序：否则退出前已经收到的消息可能在清空后重新落库。`ConversationHub` 广播重置前也会丢弃各订阅队列中的旧事件；页面使用账号世代号忽略仍在途的旧历史响应。
+先停生产者、再排空消费者、最后清库是关键顺序：否则退出前已经收到的消息可能在清空后重新落库。`ConversationHub` 广播重置前会清空各订阅队列；页面使用账号世代号忽略仍在途的清理前历史响应。
 
 ## 5. 外部同步发送
 
@@ -173,9 +173,14 @@ sequenceDiagram
 
 应用服务使用异步锁串行化唯一账号的出站动作，避免媒体上传和消息项交叉；同一把锁也覆盖账号退出与清理。服务不做后台出站重试。
 
-每个 POST 都生成新的 UUID。外部 `Idempotency-Key` 被忽略，网络在 iLink 接受后、HTTP 响应前断开时存在提交歧义；重试可能重复通知。
+每个 POST 都生成新的 UUID。文字、图片和文件同步成功响应还会返回微信
+`sendmessage.message_id`，外部字段名为 `msg_id`；原始值不持久化，SQLite
+只保存账号隔离哈希。输入状态没有微信聊天消息，因此 `msg_id=null`。外部
+`Idempotency-Key` 被忽略，网络在 iLink 接受后、HTTP 响应前断开时存在提交
+歧义；重试可能重复通知。
 
-外部 OpenAPI 只保留这个 POST。消息列表、单 ID 查询、收件人和外部状态路径已经移除。完整内容只能通过管理端的另一套认证读取。
+外部 OpenAPI 只包含这个 POST。消息列表、单 ID 查询、收件人和微信状态属于
+管理端能力，完整内容只能通过管理端的独立认证读取。
 
 ### 出站类型
 
@@ -184,7 +189,9 @@ sequenceDiagram
 - `file` -> `getuploadurl`、AES/CDN 上传、可选说明文字、文件 `sendmessage`；
 - `typing_start` / `typing_cancel` -> `getconfig` 取得 ticket 后调用 `sendtyping`。
 
-媒体经标准 Base64 解码，默认上限 20 MiB、绝对上限 25 MiB。当前内置客户端没有对原生语音、视频或引用发送完成稳定建模，因此公共 API 不开放这些类型。管理页面可保存结构化的本地引用关系，但出站只会使用带 `【桥接引用】` 明确标记的普通文本表达；它不是微信原生引用，外部 API 也不接受引用字段。
+媒体经标准 Base64 解码，默认上限 20 MiB、绝对上限 25 MiB。公共 API 和
+管理页面不开放原生语音、视频或 Bot 出站引用；`ref_msg` 只进入微信入站
+解析链路。
 
 ## 6. 微信入站与 Sink
 
@@ -199,7 +206,7 @@ sequenceDiagram
 7. 把仅供进程内聊天 Sink 使用的媒体附加到事件，再放入 `InboundDispatcher`；
 8. 整批处理成功后持久化新的 `get_updates_buf`。
 
-媒体字段在 Pydantic 模型中显式排除序列化，因此 `inbound_events.payload_json`、LoggingSink 和 Webhook 信封都不会包含媒体字节。解析器不生成 `[image]`、`[voice]` 等占位符，也不把图片 URL 拼入正文；对上游遗留占位符仍会过滤。下载失败、超时或超过上限时仍转发原始消息类型，不阻断消息历史。解析后的微信原生引用标题、类型和正文快照进入事件与 Webhook。
+媒体字段在 Pydantic 模型中显式排除序列化，因此 `inbound_events.payload_json`、LoggingSink 和 Webhook 信封都不会包含媒体字节。解析器不生成 `[image]`、`[voice]` 等占位符，也不把图片 URL 拼入正文；iLink 媒体占位符会被过滤。下载失败、超时或超过上限时仍转发原始消息类型，不阻断消息历史。解析后的微信原生引用标题、类型和正文快照进入事件与 Webhook。
 
 Dispatcher 顺序调用：
 
@@ -229,7 +236,8 @@ sequenceDiagram
     H-->>B: WebSocket
 ```
 
-当前 Webhook 队列不是重启可续投的可靠队列。后续可靠化应增加持久投递、投递审计与死信，而不是把慢逻辑放回长轮询处理。
+Webhook 使用有界进程内队列和有限重试，不提供重启续投；需要强可靠消费时，
+下游必须先持久化事件并按 `event_id` 去重。
 
 ## 7. 管理 Web
 
@@ -243,13 +251,13 @@ sequenceDiagram
 - 页面负责首次扫码、二维码刷新和可选配对数字输入；二维码图片接口不会暴露上游原始 URL。
 - 退出使用 Basic Auth 下的原生 URL 编码表单，并校验隐藏的短期页面令牌；成功清除后重定向回登录视图。
 - 输入框键入使用 `TypingLeaseService`；浏览器刷新防抖定时器，服务端租约到期后兜底取消微信输入状态。
-- 任意消息可右键建立桥接引用；页面明确提示微信侧收到带前缀的普通文本。微信入站原生引用以不可跳转的原生引用快照展示，两者不会混淆。
+- 微信入站原生引用以只读快照展示；引用 item ID 精确匹配到已保存历史的顶层 message ID 或 item ID 时，引用框可点击定位原文并让目标气泡闪高两次。页面不提供右键引用或 Bot 出站引用。
 
 Basic 密码与外部 Bearer Key 不得复用。没有 `WBB_WEB_PASSWORD` 时整个管理端关闭。HTML 使用 `no-store`、严格 CSP 和禁止 framing；媒体启用 `nosniff` 与沙箱 CSP。
 
-页面先建立 WebSocket，再在网关进入 `listening` 后加载 SQLite 历史并按 ID upsert，可覆盖“订阅与初次加载之间”的竞态。断线后自动重连；进程总线对慢订阅者丢弃最旧事件，因此历史接口始终是恢复依据。收到 `account_reset` 后页面立即清空内存消息、附件、引用和游标，并切换到扫码视图。
+页面先建立 WebSocket，再在网关进入 `listening` 后加载 SQLite 历史并按 ID upsert，可覆盖“订阅与初次加载之间”的竞态。断线后自动重连；进程总线对慢订阅者丢弃最旧事件，因此历史接口始终是恢复依据。收到 `account_reset` 后页面立即清空内存消息、附件、原生引用快照和游标，并切换到扫码视图。
 
-管理历史从最新一页向前使用 `(occurred_at, id)` 不透明游标，页内按时间正序。响应包含完整文字、受保护媒体 URL、方向、来源、状态和一层引用快照，但不包含 owner ID、上下文或凭据。
+管理历史从最新一页向前使用 `(occurred_at, id)` 不透明游标，页内按时间正序。响应包含完整文字、受保护媒体 URL、方向、来源、状态和微信入站原生引用快照；引用目标经官方协议 ID 精确匹配时额外返回管理端消息 ID，但不包含原始顶层 message ID、item ID、owner ID、上下文或凭据。
 
 ## 8. SQLite
 
@@ -265,16 +273,16 @@ Docker 持久化布局：
 主要表：
 
 - `bridge_state`：当前授权 fingerprint 和 cursor 等状态；
-- `recipients`：兼容表名，实际只保留 `alias=owner` 的唯一上下文；
+- `recipients`：保存 `alias=owner` 的唯一会话上下文；
 - `inbound_events`：入站事件去重；
-- `outbound_messages`：同步出站结果与旧数据库兼容审计；
-- `chat_messages`：管理页面完整会话内容、媒体、方向、来源、状态、可空的桥接引用目标 ID，以及微信原生引用快照。
+- `outbound_messages`：同步出站审计；
+- `chat_messages`：管理页面完整会话内容、媒体、方向、来源、状态，以及微信原生引用快照。
 
-文字直接保存在 `chat_messages.text`。页面发送以及内置客户端下载成功的微信入站图片和文件保存在 BLOB，并通过 Basic 保护的媒体接口读取；图片以内容签名判断安全 MIME，未知内容使用 `application/octet-stream`，SVG 等未识别内容不会作为可内嵌图片提供。桥接引用通过 `quote_message_id` 自连接；微信原生引用保存 `native_quote_title/type/text`，因为上游没有提供稳定目标 ID。查询统一返回一层引用快照，避免递归展开。
+文字直接保存在 `chat_messages.text`。页面发送以及内置客户端下载成功的微信入站图片和文件保存在 BLOB，并通过 Basic 保护的媒体接口读取；图片以内容签名判断安全 MIME，未知内容使用 `application/octet-stream`，SVG 等未识别内容不会作为可内嵌图片提供。微信入站消息的官方 `MessageItem.msg_id` 和顶层 `WeixinMessage.message_id` 分别与账号 ID 一起哈希后保存在内部 `protocol_item_id`、`protocol_message_id`，不落原始值。Bot 出站主项固定使用本地消息 UUID 作为顶层 `client_id`，传输层解析线上 `sendmessage` 成功响应的整数 `message_id`；该值与微信引用中的 `MessageItem.msg_id` 相同，成功投递后按同样规则哈希写入对应出站记录。引用保存 `native_quote_title/type/text`、内部 `native_quote_protocol_item_id` 和精确目标；SQLite 用引用键匹配原消息的任一协议键并回填上游缺失的正文，不使用正文或时间猜测。
 
-新出站记录先为 `sending`，再变为 `sent` 或 `failed`。进程重启会把残留 `sending` 以及旧版 `queued/retrying` 标记为 `delivery_interrupted`，绝不自动重发。授权会话变化会让进行中的旧消息变为 `interaction_required` 并清除旧 owner。
-
-旧 `outbound_messages` 中的兼容列暂时保留，内部幂等列写 `internal:<message_id>`；它不代表外部幂等语义。
+出站记录先为 `sending`，再变为 `sent` 或 `failed`。进程重启会把未完成的
+发送标记为 `delivery_interrupted`，不会自动重发。授权会话变化会让进行中的
+发送变为 `interaction_required` 并清除 owner 上下文。
 
 退出调用 `clear_all()`，在一个 `BEGIN IMMEDIATE` 事务中删除上述五张业务表。连接启用 `secure_delete`，提交后截断 WAL 并执行 `VACUUM`；数据库文件和目录保留，以便同一进程马上建立新授权。授权文件由网关在 SQLite 清理之前单独删除。
 
@@ -282,7 +290,7 @@ Docker 持久化布局：
 
 - 单进程、一个 Uvicorn worker、一个 iLink 长轮询所有者。
 - FastAPI lifespan 依次管理 SQLite、Dispatcher、Gateway task，并在关闭时停止和等待。
-- 无凭据时 Gateway task 常驻等待管理端登录事件；已有凭据时直接恢复监听。
+- 无凭据时 Gateway task 常驻等待管理端登录事件；有有效凭据时直接启动监听。
 - 管理端输入租约任务也属于 lifespan；关闭前尽力取消仍处于活动状态的微信输入提示。
 - SQLite 共享连接通过异步锁串行。
 - 出站发送和账号退出通过同一个应用服务异步锁串行。
@@ -311,18 +319,23 @@ CLI 通过 `core/logging.py` 安装统一处理器。业务模块可以用 `extr
 
 项目不依赖第三方微信 SDK。`infrastructure/wechat/ilink/` 的职责如下：
 
-- `auth.py`：原子写入敏感授权文件，兼容原 `credentials.json` 的 camelCase 字段，并处理扫码、配对码、二维码刷新和 IDC 跳转；
+- `auth.py`：以 camelCase 格式原子读写敏感授权文件，并处理扫码、配对码、二维码刷新和 IDC 跳转；
 - `transport.py`：复用 `httpx.AsyncClient`，生成 iLink 认证头，分别设置普通请求、配置请求和长轮询超时，只把操作名、HTTP 状态和数值错误码暴露给上层；
 - `messages.py`：构造 `sendmessage` wire 对象，解析用户消息、媒体和一层入站原生引用，不让原始字典进入领域；
-- `crypto.py` / `media.py`：兼容直接 hex、Base64(raw) 和 Base64(hex) 三种历史 AES key 表示，负责 CDN 加解密、有限上传重试和流式下载上限；
+- `crypto.py` / `media.py`：支持直接 hex、Base64(raw) 和 Base64(hex) 三种 AES key 表示，负责 CDN 加解密、有限上传重试和流式下载上限；
 - `client.py`：组合文字、图片、文件、输入状态和更新批次；
 - `gateway.py`：维护管理端驱动的授权状态机、唯一会话、cursor 和领域错误边界；
 - `inbound.py`：校验扫码 owner、更新上下文、事件去重、正文规范化和受限媒体下载；
 - `delivery.py`：把领域载荷穷举映射到高层客户端调用；
 - `protocols.py` / `session.py`：隔离可测试客户端契约与授权指纹规则。
 
-`context_token` 直接由 SQLite owner 记录传给每次发送，不再回填任何第三方私有缓存。`get_updates_buf` 在整批处理成功后持久化；崩溃重放由 `event_id` 去重。授权 fingerprint 改变时，存储层清空旧 owner，必须等待新扫码账号再次发消息。
+`context_token` 由 SQLite owner 记录传给每次发送。`get_updates_buf` 在整批
+处理成功后持久化；崩溃重放由 `event_id` 去重。授权 fingerprint 改变时，
+存储层清空 owner，必须等待新扫码账号再次发消息。
 
 iLink 当前只提供 Bot 向微信发送或取消输入状态的 `sendtyping`；`getupdates` 没有微信用户输入状态事件，因此网页到微信是单向同步。协议依据、端点和升级审计见 [iLink 协议实现说明](ilink-protocol.md)。
 
-新增入站下游应实现 `InboundSink`；新增实时消费者应依赖 `ConversationPublisher`；新增出站类型必须同时更新领域模型、外部 schema、iLink wire 构造、SQLite、页面呈现、测试和文档。未来接入真正多用户渠道时应设计新的目标解析模型，不得重新暴露 iLink 联系人列表。
+新增入站下游应实现 `InboundSink`；新增实时消费者应依赖
+`ConversationPublisher`；新增出站类型必须同时更新领域模型、外部 schema、
+iLink wire 构造、SQLite、页面呈现、测试和文档。当前 iLink 渠道不暴露
+联系人列表；多用户渠道必须使用独立的目标解析模型。

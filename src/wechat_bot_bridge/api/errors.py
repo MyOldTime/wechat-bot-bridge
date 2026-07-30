@@ -13,7 +13,6 @@ from ..domain.errors import (
     GatewayTemporaryError,
     MissingContextError,
     OwnerNotBoundError,
-    QuotedMessageNotFoundError,
 )
 from ..domain.models import MessageOrigin, OutboundMessage, OutboundPayload
 
@@ -30,13 +29,11 @@ async def send_with_http_errors(
     service: NotificationService,
     payload: OutboundPayload,
     origin: MessageOrigin,
-    quote_message_id: str | None = None,
 ) -> OutboundMessage:
     return await outbound_with_http_errors(
         lambda: service.send(
             payload=payload,
             origin=origin,
-            quote_message_id=quote_message_id,
         )
     )
 
@@ -52,8 +49,6 @@ async def outbound_with_http_errors(
         raise http_error(409, exc.code, str(exc)) from exc
     except MissingContextError as exc:
         raise http_error(409, exc.code, str(exc)) from exc
-    except QuotedMessageNotFoundError as exc:
-        raise http_error(404, exc.code, str(exc)) from exc
     except GatewayNotReadyError as exc:
         raise http_error(503, exc.code, str(exc)) from exc
     except GatewayTemporaryError as exc:

@@ -9,15 +9,16 @@ from uuid import uuid4
 
 import aiosqlite
 
-from ...domain.errors import QuotedMessageNotFoundError
 from ...domain.models import (
     OWNER_ALIAS,
     ConversationDirection,
     ConversationMedia,
     ConversationMessage,
     ConversationMessagePage,
+    ConversationMessageType,
     ConversationStatus,
     InboundEvent,
+    InboundQuote,
     MessageOrigin,
     OutboundMessage,
     OutboundMessageType,
@@ -36,15 +37,8 @@ from .schema import BUSINESS_TABLES, initialize_schema
 from .transactions import immediate_transaction
 
 _CONVERSATION_SELECT_SQL = """
-    SELECT current_message.*,
-           quoted_message.id AS quote_id,
-           quoted_message.direction AS quote_direction,
-           quoted_message.message_type AS quote_message_type,
-           quoted_message.text AS quote_text,
-           quoted_message.file_name AS quote_file_name
+    SELECT current_message.*
       FROM chat_messages AS current_message
-      LEFT JOIN chat_messages AS quoted_message
-        ON quoted_message.id = current_message.quote_message_id
 """
 
 
@@ -371,13 +365,19 @@ class SQLiteStore:
         mime_type = event.media.mime_type if event.media is not None else None
         media_data = event.media.data if event.media is not None else None
         async with self._lock:
+            quote_target_id, quote_type, quote_text = await _resolve_inbound_quote(
+                connection,
+                event.quote,
+            )
             await connection.execute(
                 """
                 INSERT OR IGNORE INTO chat_messages(
                     id, direction, message_type, text, file_name, mime_type, media,
                     status, origin, error_code, occurred_at, updated_at,
-                    native_quote_title, native_quote_type, native_quote_text
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+                    protocol_item_id, protocol_message_id, native_quote_title,
+                    native_quote_type, native_quote_text, native_quote_target_id,
+                    native_quote_protocol_item_id
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     event.event_id,
@@ -391,9 +391,13 @@ class SQLiteStore:
                     MessageOrigin.WECHAT.value,
                     occurred_at,
                     occurred_at,
+                    event.protocol_item_id,
+                    event.protocol_message_id,
                     event.quote.title if event.quote is not None else None,
-                    event.quote.type if event.quote is not None else None,
-                    event.quote.text if event.quote is not None else None,
+                    quote_type,
+                    quote_text,
+                    quote_target_id,
+                    event.quote.protocol_item_id if event.quote is not None else None,
                 ),
             )
             cursor = await connection.execute(
@@ -414,14 +418,12 @@ class SQLiteStore:
         message_type: OutboundMessageType,
         payload: OutboundPayload,
         origin: MessageOrigin,
-        quote_message_id: str | None = None,
     ) -> OutboundMessage:
         connection = self._require_connection()
         now = utc_now()
         message_id = str(uuid4())
         async with self._lock:
             async with immediate_transaction(connection):
-                await _require_quote_exists(connection, quote_message_id)
                 await _insert_outbound_audit(
                     connection,
                     message_id=message_id,
@@ -435,7 +437,6 @@ class SQLiteStore:
                     payload=payload,
                     origin=origin,
                     occurred_at=now,
-                    quote_message_id=quote_message_id,
                 )
                 row = await _get_outbound_row(connection, message_id)
         if row is None:
@@ -536,7 +537,14 @@ class SQLiteStore:
             file_name=str(row["file_name"]) if row["file_name"] is not None else None,
         )
 
-    async def mark_outbound_sent(self, message_id: str) -> OutboundMessage:
+    async def mark_outbound_sent(
+        self,
+        message_id: str,
+        *,
+        protocol_item_id: str | None = None,
+    ) -> OutboundMessage:
+        """完成出站审计，并保存微信响应 ID 的账号隔离关联键。"""
+
         connection = self._require_connection()
         now = _dump_time(utc_now())
         async with self._lock:
@@ -551,10 +559,16 @@ class SQLiteStore:
             await connection.execute(
                 """
                 UPDATE chat_messages
-                   SET status = ?, updated_at = ?, error_code = NULL
+                   SET status = ?, updated_at = ?, error_code = NULL,
+                       protocol_item_id = COALESCE(?, protocol_item_id)
                  WHERE id = ?
                 """,
-                (ConversationStatus.SENT.value, now, message_id),
+                (
+                    ConversationStatus.SENT.value,
+                    now,
+                    protocol_item_id,
+                    message_id,
+                ),
             )
             cursor = await connection.execute(
                 "SELECT * FROM outbound_messages WHERE id = ?",
@@ -613,21 +627,41 @@ class SQLiteStore:
         return outbound_from_row(row)
 
 
-async def _require_quote_exists(
+async def _resolve_inbound_quote(
     connection: aiosqlite.Connection,
-    quote_message_id: str | None,
-) -> None:
-    if quote_message_id is None:
-        return
-    cursor = await connection.execute(
-        "SELECT 1 FROM chat_messages WHERE id = ?",
-        (quote_message_id,),
-    )
-    try:
-        if await cursor.fetchone() is None:
-            raise QuotedMessageNotFoundError("The quoted conversation message was not found")
-    finally:
+    quote: InboundQuote | None,
+) -> tuple[str | None, ConversationMessageType | None, str | None]:
+    """用账号隔离的协议关联键精确匹配；缺少目标时保留上游快照。"""
+
+    if quote is None:
+        return None, None, None
+
+    target_id: str | None = None
+    quote_type = quote.type
+    quote_text = quote.text
+    if quote.protocol_item_id is not None:
+        cursor = await connection.execute(
+            """
+            SELECT id, message_type, text, file_name
+              FROM chat_messages
+             WHERE protocol_item_id = ?
+                OR protocol_message_id = ?
+             ORDER BY occurred_at DESC, id DESC
+             LIMIT 1
+            """,
+            (quote.protocol_item_id, quote.protocol_item_id),
+        )
+        row = await cursor.fetchone()
         await cursor.close()
+        if row is not None:
+            target_id = str(row["id"])
+            quote_type = ConversationMessageType(str(row["message_type"]))
+            if not quote_text:
+                quote_text = str(row["text"])
+                if not quote_text and row["file_name"] is not None:
+                    quote_text = str(row["file_name"])
+
+    return target_id, quote_type, quote_text
 
 
 async def _insert_outbound_audit(
@@ -671,7 +705,6 @@ async def _insert_outbound_chat(
     payload: OutboundPayload,
     origin: MessageOrigin,
     occurred_at: datetime,
-    quote_message_id: str | None,
 ) -> None:
     chat_fields = outbound_chat_fields(payload)
     if chat_fields is None:
@@ -682,8 +715,8 @@ async def _insert_outbound_chat(
         """
         INSERT INTO chat_messages(
             id, direction, message_type, text, file_name, mime_type, media,
-            status, origin, error_code, occurred_at, updated_at, quote_message_id
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            status, origin, error_code, occurred_at, updated_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
         """,
         (
             message_id,
@@ -697,7 +730,6 @@ async def _insert_outbound_chat(
             origin.value,
             timestamp,
             timestamp,
-            quote_message_id,
         ),
     )
 

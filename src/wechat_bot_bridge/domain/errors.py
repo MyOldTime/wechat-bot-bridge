@@ -23,10 +23,6 @@ class InvalidCursorError(BridgeError):
     code = "invalid_cursor"
 
 
-class QuotedMessageNotFoundError(BridgeError):
-    code = "quoted_message_not_found"
-
-
 class GatewayNotReadyError(BridgeError):
     code = "wechat_not_ready"
 

@@ -16,6 +16,7 @@ from .models import (
     OutboundMessageType,
     OutboundPayload,
     OwnerBinding,
+    WeChatDeliveryReceipt,
 )
 
 InboundHandler = Callable[[InboundEvent], Awaitable[None]]
@@ -44,10 +45,11 @@ class WeChatGateway(Protocol):
     async def send_message(
         self,
         *,
+        message_id: str,
         user_id: str,
         payload: OutboundPayload,
         context_token: str,
-    ) -> None: ...
+    ) -> WeChatDeliveryReceipt: ...
 
 
 class InboundSink(Protocol):
@@ -87,10 +89,14 @@ class OutboundMessageStore(Protocol):
         message_type: OutboundMessageType,
         payload: OutboundPayload,
         origin: MessageOrigin,
-        quote_message_id: str | None = None,
     ) -> OutboundMessage: ...
 
-    async def mark_outbound_sent(self, message_id: str) -> OutboundMessage: ...
+    async def mark_outbound_sent(
+        self,
+        message_id: str,
+        *,
+        protocol_item_id: str | None = None,
+    ) -> OutboundMessage: ...
 
     async def mark_outbound_failed(self, message_id: str, error_code: str) -> OutboundMessage: ...
 

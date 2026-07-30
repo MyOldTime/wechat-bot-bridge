@@ -61,7 +61,7 @@ def outbound_from_row(row: aiosqlite.Row) -> OutboundMessage:
 
 
 def conversation_from_row(row: aiosqlite.Row) -> ConversationMessage:
-    """恢复聊天记录及其一层引用快照。"""
+    """恢复聊天记录及其微信原生引用快照。"""
 
     return ConversationMessage(
         id=str(row["id"]),
@@ -108,16 +108,11 @@ def outbound_chat_fields(payload: OutboundPayload) -> OutboundChatFields | None:
 
 
 def _quote_from_row(row: aiosqlite.Row) -> ConversationQuote | None:
-    if row["quote_id"] is not None:
-        return ConversationQuote(
-            id=str(row["quote_id"]),
-            direction=ConversationDirection(str(row["quote_direction"])),
-            message_type=ConversationMessageType(str(row["quote_message_type"])),
-            text=str(row["quote_text"]),
-            file_name=(str(row["quote_file_name"]) if row["quote_file_name"] is not None else None),
-            title=None,
-        )
-    if row["native_quote_text"] is None and row["native_quote_title"] is None:
+    if (
+        row["native_quote_text"] is None
+        and row["native_quote_title"] is None
+        and row["native_quote_target_id"] is None
+    ):
         return None
 
     native_type = (
@@ -126,11 +121,13 @@ def _quote_from_row(row: aiosqlite.Row) -> ConversationQuote | None:
         else ConversationMessageType.TEXT.value
     )
     return ConversationQuote(
-        id=None,
-        direction=None,
+        target_message_id=(
+            str(row["native_quote_target_id"])
+            if row["native_quote_target_id"] is not None
+            else None
+        ),
         message_type=ConversationMessageType(native_type),
         text=str(row["native_quote_text"]) if row["native_quote_text"] is not None else "",
-        file_name=None,
         title=(str(row["native_quote_title"]) if row["native_quote_title"] is not None else None),
     )
 

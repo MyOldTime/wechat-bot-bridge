@@ -26,6 +26,7 @@ from wechat_bot_bridge.domain.models import (
     TextPayload,
     TypingCancelPayload,
     TypingStartPayload,
+    WeChatDeliveryReceipt,
 )
 from wechat_bot_bridge.infrastructure.inbound.dispatcher import InboundDispatcher
 from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore
@@ -39,7 +40,7 @@ class FakeGateway:
     def __init__(self) -> None:
         self._stop = asyncio.Event()
         self._session_fingerprint: str | None = SESSION
-        self.sent: list[tuple[str, OutboundPayload, str]] = []
+        self.sent: list[tuple[str, str, OutboundPayload, str]] = []
         self.outcomes: list[Exception | None] = []
         self.stop_called = False
 
@@ -65,15 +66,22 @@ class FakeGateway:
     async def send_message(
         self,
         *,
+        message_id: str,
         user_id: str,
         payload: OutboundPayload,
         context_token: str,
-    ) -> None:
-        self.sent.append((user_id, payload, context_token))
+    ) -> WeChatDeliveryReceipt:
+        self.sent.append((message_id, user_id, payload, context_token))
         if self.outcomes:
             outcome = self.outcomes.pop(0)
             if outcome is not None:
                 raise outcome
+        is_typing = isinstance(payload, (TypingStartPayload, TypingCancelPayload))
+        server_message_id = None if is_typing else f"server-message-{len(self.sent)}"
+        return WeChatDeliveryReceipt(
+            wechat_message_id=server_message_id,
+            protocol_item_id=(None if is_typing else f"server-message-hash-{len(self.sent)}"),
+        )
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -217,11 +225,23 @@ async def test_each_external_post_is_a_distinct_synchronous_message(
         assert repeated.status_code == 200
         assert first.json()["status"] == "sent"
         assert first.json()["type"] == "text"
+        assert first.json()["msg_id"] == "server-message-1"
+        assert repeated.json()["msg_id"] == "server-message-2"
         assert first.json()["id"] != repeated.json()["id"]
         assert "location" not in first.headers
         assert gateway.sent == [
-            ("user-1", TextPayload(text="task complete"), "private-context"),
-            ("user-1", TextPayload(text="task complete"), "private-context"),
+            (
+                first.json()["id"],
+                "user-1",
+                TextPayload(text="task complete"),
+                "private-context",
+            ),
+            (
+                repeated.json()["id"],
+                "user-1",
+                TextPayload(text="task complete"),
+                "private-context",
+            ),
         ]
 
 
@@ -259,7 +279,14 @@ async def test_external_endpoint_supports_public_sdk_message_types(
         assert [response.json()["type"] for response in responses] == [
             expected_type for _body, expected_type in requests
         ]
-        assert [call[1] for call in gateway.sent] == [
+        assert [response.json()["msg_id"] for response in responses] == [
+            "server-message-1",
+            "server-message-2",
+            "server-message-3",
+            None,
+            None,
+        ]
+        assert [call[2] for call in gateway.sent] == [
             TextPayload(text="hello"),
             ImagePayload(data=b"binary-content", caption="screenshot"),
             FilePayload(data=b"binary-content", file_name="report.pdf", caption="report"),
@@ -269,7 +296,7 @@ async def test_external_endpoint_supports_public_sdk_message_types(
 
 
 async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> None:
-    async with _running_client(tmp_path) as (client, app, _gateway):
+    async with _running_client(tmp_path) as (client, app, gateway):
         await _seed_owner(app)
         bodies = [
             {
@@ -295,12 +322,18 @@ async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> 
                 "text": "引用只属于管理页面",
                 "quote_message_id": "private-chat-message",
             },
+            {
+                "type": "text",
+                "text": "当前协议不支持出站原生引用",
+                "quote_msg_id": "wechat-server-message-id",
+            },
         ]
         responses = [
             await client.post("/api/v1/messages", headers=AUTHORIZATION, json=body)
             for body in bodies
         ]
         assert [response.status_code for response in responses] == [422] * len(bodies)
+        assert gateway.sent == []
 
 
 async def test_external_endpoint_maps_application_errors(tmp_path: Path) -> None:

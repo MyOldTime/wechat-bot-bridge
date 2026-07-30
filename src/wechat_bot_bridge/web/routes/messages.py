@@ -12,18 +12,13 @@ from ...api.errors import (
     outbound_with_http_errors,
     send_with_http_errors,
 )
-from ...api.schemas import SendMessageResponse
+from ...api.schemas import SendMessageRequest, SendMessageResponse, to_domain_payload
 from ...application.messaging import NotificationService
 from ...application.typing import TypingLeaseService
 from ...domain.errors import InvalidCursorError
 from ...domain.models import MessageOrigin, TypingCancelPayload, TypingStartPayload
 from ...domain.ports import BridgeStore
-from ..schemas import (
-    AdminSendMessageRequest,
-    ConversationMessagePageResponse,
-    admin_to_domain_payload,
-    quote_message_id,
-)
+from ..schemas import ConversationMessagePageResponse
 from ..security import require_admin_token
 
 
@@ -70,14 +65,15 @@ def build_message_router() -> APIRouter:
     @router.post(
         "/api/messages",
         response_model=SendMessageResponse,
+        response_model_exclude={"msg_id"},
     )
     async def send_from_web(
         request: Request,
-        body: AdminSendMessageRequest,
+        body: SendMessageRequest,
         admin_token: Annotated[str, Header(alias="X-Admin-Token")],
     ) -> SendMessageResponse:
         require_admin_token(request, admin_token)
-        payload = admin_to_domain_payload(body)
+        payload = to_domain_payload(body)
         typing_lease: TypingLeaseService = request.app.state.typing_lease
         if isinstance(payload, TypingStartPayload):
             message = await outbound_with_http_errors(typing_lease.start)
@@ -93,7 +89,6 @@ def build_message_router() -> APIRouter:
             service=service,
             payload=payload,
             origin=MessageOrigin.WEB_ADMIN,
-            quote_message_id=quote_message_id(body),
         )
         return SendMessageResponse.from_domain(message)
 

@@ -3,19 +3,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated
 from urllib.parse import quote
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from ..api.schemas import (
-    FileMessageRequest,
-    ImageMessageRequest,
-    TextMessageRequest,
-    TypingCancelRequest,
-    TypingStartRequest,
-    to_domain_payload,
-)
 from ..domain.models import (
     ConversationDirection,
     ConversationMessage,
@@ -24,67 +15,29 @@ from ..domain.models import (
     ConversationQuote,
     ConversationStatus,
     MessageOrigin,
-    OutboundPayload,
 )
-
-
-class AdminTextMessageRequest(TextMessageRequest):
-    quote_message_id: str | None = Field(default=None, min_length=1, max_length=128)
-
-
-class AdminImageMessageRequest(ImageMessageRequest):
-    quote_message_id: str | None = Field(default=None, min_length=1, max_length=128)
-
-
-class AdminFileMessageRequest(FileMessageRequest):
-    quote_message_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 class AdminVerificationCodeRequest(BaseModel):
     code: str = Field(min_length=1, max_length=32, pattern=r"^\d+$")
 
 
-type AdminSendMessageRequest = Annotated[
-    AdminTextMessageRequest
-    | AdminImageMessageRequest
-    | AdminFileMessageRequest
-    | TypingStartRequest
-    | TypingCancelRequest,
-    Field(discriminator="type"),
-]
+class InboundQuoteResponse(BaseModel):
+    """管理页面可见的微信原生引用快照。"""
 
-
-def admin_to_domain_payload(request: AdminSendMessageRequest) -> OutboundPayload:
-    return to_domain_payload(request)
-
-
-def quote_message_id(request: AdminSendMessageRequest) -> str | None:
-    if isinstance(
-        request,
-        (AdminTextMessageRequest, AdminImageMessageRequest, AdminFileMessageRequest),
-    ):
-        return request.quote_message_id
-    return None
-
-
-class ConversationQuoteResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    id: str | None = None
-    direction: ConversationDirection | None = None
+    message_id: str | None = None
     message_type: ConversationMessageType = Field(serialization_alias="type")
     text: str
-    file_name: str | None = None
     title: str | None = None
 
     @classmethod
-    def from_domain(cls, quoted: ConversationQuote) -> ConversationQuoteResponse:
+    def from_domain(cls, quoted: ConversationQuote) -> InboundQuoteResponse:
         return cls(
-            id=quoted.id,
-            direction=quoted.direction,
+            message_id=quoted.target_message_id,
             message_type=quoted.message_type,
             text=quoted.text,
-            file_name=quoted.file_name,
             title=quoted.title,
         )
 
@@ -104,7 +57,7 @@ class ConversationMessageResponse(BaseModel):
     error_code: str | None = None
     occurred_at: datetime
     updated_at: datetime
-    quote: ConversationQuoteResponse | None = None
+    quote: InboundQuoteResponse | None = None
 
     @classmethod
     def from_domain(
@@ -128,7 +81,7 @@ class ConversationMessageResponse(BaseModel):
             occurred_at=message.occurred_at,
             updated_at=message.updated_at,
             quote=(
-                ConversationQuoteResponse.from_domain(message.quote)
+                InboundQuoteResponse.from_domain(message.quote)
                 if message.quote is not None
                 else None
             ),

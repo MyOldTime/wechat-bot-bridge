@@ -100,6 +100,7 @@ class QuotedMessage:
     title: str | None
     text: str
     type: ContentType
+    item_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,6 +113,8 @@ class IncomingMessage:
     text: str
     type: ContentType
     timestamp: datetime
+    message_id: str | None = None
+    item_id: str | None = None
     media: tuple[MediaReference, ...] = ()
     quoted_message: QuotedMessage | None = None
 

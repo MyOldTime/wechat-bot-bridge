@@ -72,10 +72,13 @@ _BASE_SCHEMA_SQL: Final[str] = """
         error_code TEXT,
         occurred_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        quote_message_id TEXT,
+        protocol_item_id TEXT,
+        protocol_message_id TEXT,
         native_quote_title TEXT,
         native_quote_type TEXT,
-        native_quote_text TEXT
+        native_quote_text TEXT,
+        native_quote_target_id TEXT,
+        native_quote_protocol_item_id TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_chat_history
         ON chat_messages(occurred_at DESC, id DESC);
@@ -127,10 +130,13 @@ async def _migrate_outbound_messages(connection: aiosqlite.Connection) -> None:
 async def _migrate_chat_messages(connection: aiosqlite.Connection) -> None:
     columns = await _table_columns(connection, "chat_messages")
     additions = {
-        "quote_message_id": "TEXT",
+        "protocol_item_id": "TEXT",
+        "protocol_message_id": "TEXT",
         "native_quote_title": "TEXT",
         "native_quote_type": "TEXT",
         "native_quote_text": "TEXT",
+        "native_quote_target_id": "TEXT",
+        "native_quote_protocol_item_id": "TEXT",
     }
     for column_name, column_type in additions.items():
         if column_name not in columns:
@@ -138,10 +144,24 @@ async def _migrate_chat_messages(connection: aiosqlite.Connection) -> None:
             await connection.execute(
                 f"ALTER TABLE chat_messages ADD COLUMN {column_name} {column_type}"
             )
+    # 旧版本的桥接引用列可以保留以兼容已有数据库，但不再读取或写入。
+    await connection.execute("DROP INDEX IF EXISTS idx_chat_quote")
     await connection.execute(
         """
-        CREATE INDEX IF NOT EXISTS idx_chat_quote
-            ON chat_messages(quote_message_id)
+        CREATE INDEX IF NOT EXISTS idx_chat_protocol_item
+            ON chat_messages(protocol_item_id)
+        """
+    )
+    await connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_protocol_message
+            ON chat_messages(protocol_message_id)
+        """
+    )
+    await connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_chat_quote_protocol_item
+            ON chat_messages(native_quote_protocol_item_id)
         """
     )
 

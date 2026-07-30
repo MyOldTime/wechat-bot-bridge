@@ -12,14 +12,19 @@ import pytest
 from wechat_bot_bridge.core.config import Settings
 from wechat_bot_bridge.domain.errors import GatewayTemporaryError
 from wechat_bot_bridge.domain.models import (
+    ConversationMessage,
     FilePayload,
     GatewayPhase,
     ImagePayload,
     InboundEvent,
+    MessageOrigin,
+    OutboundMessageType,
     TextPayload,
     TypingCancelPayload,
     TypingStartPayload,
+    WeChatDeliveryReceipt,
 )
+from wechat_bot_bridge.domain.references import scoped_protocol_item_id
 from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore
 from wechat_bot_bridge.infrastructure.wechat.gateway import (
     WeChatILinkGateway,
@@ -90,20 +95,24 @@ class FakeClient:
         self.calls: list[tuple[object, ...]] = []
         self.downloaded: DownloadedMedia | None = None
         self.send_error: Exception | None = None
+        self.server_message_id: str | None = "server-message-1"
 
     async def get_updates(self, cursor: str) -> UpdateBatch:
         return UpdateBatch(cursor=cursor, messages=())
 
-    async def send_text(self, **kwargs: object) -> None:
+    async def send_text(self, **kwargs: object) -> str | None:
         if self.send_error is not None:
             raise self.send_error
         self.calls.append(("text", kwargs))
+        return self.server_message_id
 
-    async def send_image(self, **kwargs: object) -> None:
+    async def send_image(self, **kwargs: object) -> str | None:
         self.calls.append(("image", kwargs))
+        return self.server_message_id
 
-    async def send_file(self, **kwargs: object) -> None:
+    async def send_file(self, **kwargs: object) -> str | None:
         self.calls.append(("file", kwargs))
+        return self.server_message_id
 
     async def set_typing(self, **kwargs: object) -> None:
         self.calls.append(("typing", kwargs))
@@ -158,27 +167,32 @@ async def test_gateway_maps_all_supported_payloads_to_internal_client(tmp_path: 
     )
     client = _attach_client(gateway, _credentials())
 
-    await gateway.send_message(
+    text_protocol_id = await gateway.send_message(
+        message_id="local-text",
         user_id="user-1",
         payload=TextPayload(text="hello"),
         context_token="context-1",
     )
     await gateway.send_message(
+        message_id="local-image",
         user_id="user-1",
         payload=ImagePayload(data=b"image", caption="caption"),
         context_token="context-1",
     )
     await gateway.send_message(
+        message_id="local-file",
         user_id="user-1",
         payload=FilePayload(data=b"file", file_name="report.pdf", caption=None),
         context_token="context-1",
     )
     await gateway.send_message(
+        message_id="local-typing-start",
         user_id="user-1",
         payload=TypingStartPayload(),
         context_token="context-1",
     )
     await gateway.send_message(
+        message_id="local-typing-cancel",
         user_id="user-1",
         payload=TypingCancelPayload(),
         context_token="context-1",
@@ -190,6 +204,7 @@ async def test_gateway_maps_all_supported_payloads_to_internal_client(tmp_path: 
             {
                 "user_id": "user-1",
                 "context_token": "context-1",
+                "message_id": "local-text",
                 "text": "hello",
             },
         ),
@@ -198,6 +213,7 @@ async def test_gateway_maps_all_supported_payloads_to_internal_client(tmp_path: 
             {
                 "user_id": "user-1",
                 "context_token": "context-1",
+                "message_id": "local-image",
                 "data": b"image",
                 "caption": "caption",
             },
@@ -207,6 +223,7 @@ async def test_gateway_maps_all_supported_payloads_to_internal_client(tmp_path: 
             {
                 "user_id": "user-1",
                 "context_token": "context-1",
+                "message_id": "local-file",
                 "data": b"file",
                 "file_name": "report.pdf",
                 "caption": None,
@@ -229,6 +246,10 @@ async def test_gateway_maps_all_supported_payloads_to_internal_client(tmp_path: 
             },
         ),
     ]
+    assert text_protocol_id == WeChatDeliveryReceipt(
+        wechat_message_id="server-message-1",
+        protocol_item_id=scoped_protocol_item_id("account-1", "server-message-1"),
+    )
 
 
 async def test_gateway_maps_upstream_temporary_error(tmp_path: Path) -> None:
@@ -242,6 +263,7 @@ async def test_gateway_maps_upstream_temporary_error(tmp_path: Path) -> None:
 
     with pytest.raises(GatewayTemporaryError):
         await gateway.send_message(
+            message_id="local-text",
             user_id="user-1",
             payload=TextPayload(text="hello"),
             context_token="context-1",
@@ -268,10 +290,13 @@ async def test_owner_inbound_binds_context_keeps_quote_and_deduplicates(
         text="hello",
         type="text",
         timestamp=datetime(2026, 7, 28, 12, 0, tzinfo=UTC),
+        message_id="top-message-100",
+        item_id="current-item-100",
         quoted_message=QuotedMessage(
             title="微信桥接",
             text="瓷器",
             type="text",
+            item_id="quoted-item-99",
         ),
     )
 
@@ -286,7 +311,19 @@ async def test_owner_inbound_binds_context_keeps_quote_and_deduplicates(
         assert event.quote is not None
         assert event.quote.title == "微信桥接"
         assert event.quote.text == "瓷器"
-        assert "must-not-leak" not in event.model_dump_json()
+        assert event.protocol_item_id is not None
+        assert len(event.protocol_item_id) == 64
+        assert event.protocol_message_id is not None
+        assert len(event.protocol_message_id) == 64
+        assert event.protocol_message_id != event.protocol_item_id
+        assert event.quote.protocol_item_id is not None
+        assert len(event.quote.protocol_item_id) == 64
+        assert event.protocol_item_id != event.quote.protocol_item_id
+        serialized = event.model_dump_json()
+        assert "must-not-leak" not in serialized
+        assert "top-message-100" not in serialized
+        assert "current-item-100" not in serialized
+        assert "quoted-item-99" not in serialized
 
         owner = await store.resolve_owner(credential_fingerprint(credentials))
         assert owner is not None
@@ -391,7 +428,9 @@ async def test_non_owner_and_missing_context_cannot_bind_owner(tmp_path: Path) -
         await store.close()
 
 
-async def test_poll_loop_persists_cursor_after_inbound_delivery(tmp_path: Path) -> None:
+async def test_poll_loop_resolves_quote_and_persists_cursor(
+    tmp_path: Path,
+) -> None:
     store = SQLiteStore(tmp_path / "bridge.db")
     await store.open()
     dispatcher = CaptureDispatcher()
@@ -403,6 +442,21 @@ async def test_poll_loop_persists_cursor_after_inbound_delivery(tmp_path: Path) 
     credentials = _credentials()
     fingerprint = credential_fingerprint(credentials)
     await store.activate_session(fingerprint)
+    outbound = await store.begin_outbound(
+        user_id="user-1",
+        message_type=OutboundMessageType.TEXT,
+        payload=TextPayload(text="被引用的 Bot 原文"),
+        origin=MessageOrigin.WEB_ADMIN,
+    )
+    server_reference = scoped_protocol_item_id(
+        "account-1",
+        "server-item-in-same-batch",
+    )
+    assert server_reference is not None
+    await store.mark_outbound_sent(
+        outbound.id,
+        protocol_item_id=server_reference,
+    )
     client = _attach_client(gateway, credentials)
     gateway._cursor = "cursor-1"
 
@@ -417,12 +471,21 @@ async def test_poll_loop_persists_cursor_after_inbound_delivery(tmp_path: Path) 
                     text="delivered before cursor",
                     type="text",
                     timestamp=datetime.now(UTC),
+                    quoted_message=QuotedMessage(
+                        title=None,
+                        text="",
+                        type="text",
+                        item_id="server-item-in-same-batch",
+                    ),
                 ),
             ),
         )
 
+    recorded: list[ConversationMessage] = []
+
     async def publish_and_stop(event: InboundEvent) -> None:
         dispatcher.events.append(event)
+        recorded.append(await store.record_inbound_conversation(event))
         await gateway.stop()
 
     client.get_updates = one_batch  # type: ignore[method-assign]
@@ -433,6 +496,9 @@ async def test_poll_loop_persists_cursor_after_inbound_delivery(tmp_path: Path) 
 
         assert len(dispatcher.events) == 1
         assert dispatcher.events[0].message.text == "delivered before cursor"
+        assert recorded[0].quote is not None
+        assert recorded[0].quote.target_message_id == outbound.id
+        assert recorded[0].quote.text == "被引用的 Bot 原文"
         assert await store.get_state(f"cursor:{fingerprint}") == "cursor-2"
     finally:
         await store.close()

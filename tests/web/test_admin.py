@@ -7,6 +7,7 @@ import base64
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -28,9 +29,9 @@ from wechat_bot_bridge.domain.models import (
     InboundQuote,
     InboundSender,
     OutboundPayload,
-    TextPayload,
     TypingCancelPayload,
     TypingStartPayload,
+    WeChatDeliveryReceipt,
 )
 from wechat_bot_bridge.infrastructure.inbound.dispatcher import InboundDispatcher
 from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore, utc_now
@@ -102,13 +103,18 @@ class FakeGateway:
     async def send_message(
         self,
         *,
+        message_id: str,
         user_id: str,
         payload: OutboundPayload,
         context_token: str,
-    ) -> None:
+    ) -> WeChatDeliveryReceipt:
         assert user_id == "owner-user"
         assert context_token == "private-context"
         self.sent.append(payload)
+        return WeChatDeliveryReceipt(
+            wechat_message_id="server-item-reference",
+            protocol_item_id="server-item-reference",
+        )
 
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
@@ -197,6 +203,8 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
         missing = await client.get("/admin")
         bearer_on_web = await client.get("/admin", headers=BEARER)
         page = await client.get("/admin", headers=WEB_BASIC)
+        chat_script = await client.get("/admin/static/chat.js", headers=WEB_BASIC)
+        chat_style = await client.get("/admin/static/chat.css", headers=WEB_BASIC)
         basic_on_external = await client.post(
             "/api/v1/messages",
             headers=WEB_BASIC,
@@ -217,6 +225,16 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
         assert 'id="login-panel"' in page.text
         assert 'action="/admin/logout"' in page.text
         assert '<meta name="typing-timeout-seconds" content="5">' in page.text
+        assert "桥接引用" not in page.text
+        assert "quote-message-action" not in page.text
+        assert chat_script.status_code == 200
+        assert "微信原生引用" in chat_script.text
+        assert "focusQuotedMessage" in chat_script.text
+        assert "quote-target" in chat_script.text
+        assert "quote_message_id" not in chat_script.text
+        assert 'addEventListener("contextmenu"' not in chat_script.text
+        assert chat_style.status_code == 200
+        assert "animation: quote-highlight 0.5s ease-in-out 2" in chat_style.text
         assert page.headers["cache-control"] == "no-store"
         assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
         assert basic_on_external.status_code == 401
@@ -406,6 +424,7 @@ async def test_admin_send_requires_page_token_and_records_web_origin(
         assert missing_token.status_code == 422
         assert invalid_token.status_code == 403
         assert sent.status_code == 200
+        assert "msg_id" not in sent.json()
         assert len(gateway.sent) == 1
         assert history.json()["items"][0]["text"] == "从页面发送"
         assert history.json()["items"][0]["origin"] == "web_admin"
@@ -439,90 +458,117 @@ async def test_admin_typing_requests_use_server_lease_and_explicit_cancel(
         ]
 
 
-async def test_admin_quote_keeps_relation_and_sends_visible_bridge_prefix(
+async def test_admin_rejects_removed_outbound_quote_field(
     tmp_path: Path,
 ) -> None:
-    event = InboundEvent(
-        event_id="wechat-message-to-quote",
-        occurred_at=utc_now(),
-        sender=InboundSender(user_id="owner-user"),
-        message=InboundMessageBody(type="text", text="需要引用的消息"),
-    )
     async with _running_client(tmp_path) as (client, app, gateway):
         await _seed_owner(app)
-        await app.state.store.record_inbound_conversation(event)
         page = await client.get("/admin", headers=WEB_BASIC)
         token = _extract_admin_token(page.text)
 
-        sent = await client.post(
+        rejected = await client.post(
             "/admin/api/messages",
             headers={**WEB_BASIC, "X-Admin-Token": token},
             json={
                 "type": "text",
                 "text": "引用回复",
-                "quote_message_id": event.event_id,
+                "quote_message_id": "removed-feature",
             },
         )
-        history = await client.get("/admin/api/messages", headers=WEB_BASIC)
 
-        assert sent.status_code == 200
-        assert gateway.sent == [TextPayload(text="【桥接引用·对方】需要引用的消息\n引用回复")]
-        reply = history.json()["items"][-1]
-        assert reply["text"] == "引用回复"
-        assert reply["quote"] == {
-            "id": event.event_id,
-            "direction": "inbound",
-            "type": "text",
-            "text": "需要引用的消息",
-            "file_name": None,
-            "title": None,
-        }
-
-        missing = await client.post(
-            "/admin/api/messages",
-            headers={**WEB_BASIC, "X-Admin-Token": token},
-            json={
-                "type": "text",
-                "text": "无效引用",
-                "quote_message_id": "does-not-exist",
-            },
-        )
-        assert missing.status_code == 404
-        assert missing.json()["detail"]["code"] == "quoted_message_not_found"
+        assert rejected.status_code == 422
+        assert gateway.sent == []
 
 
 async def test_inbound_dispatcher_reuses_chat_history_sink_and_updates_history(
     tmp_path: Path,
 ) -> None:
-    event = InboundEvent(
+    original_time = utc_now()
+    original = InboundEvent(
+        event_id="wechat-event-original",
+        occurred_at=original_time,
+        sender=InboundSender(user_id="owner-user"),
+        message=InboundMessageBody(type="text", text="测试"),
+        protocol_item_id="wechat-item-original",
+    )
+    reply = InboundEvent(
         event_id="wechat-event-1",
-        occurred_at=utc_now(),
+        occurred_at=original_time + timedelta(seconds=1),
         sender=InboundSender(user_id="owner-user"),
         message=InboundMessageBody(type="text", text="微信刚发来的内容"),
-        quote=InboundQuote(title="微信桥接", text="瓷器"),
+        protocol_item_id="wechat-item-reply",
+        quote=InboundQuote(
+            title="微信桥接",
+            text="",
+            protocol_item_id="wechat-item-original",
+        ),
     )
     async with _running_client(tmp_path) as (client, app, _gateway):
-        await app.state.dispatcher.publish(event)
+        await app.state.dispatcher.publish(original)
+        await app.state.dispatcher.publish(reply)
 
         for _attempt in range(50):
             history = await client.get("/admin/api/messages", headers=WEB_BASIC)
-            if history.json()["items"]:
+            if len(history.json()["items"]) == 2:
                 break
             await asyncio.sleep(0.01)
 
-        item = history.json()["items"][0]
+        item = history.json()["items"][1]
         assert item["direction"] == "inbound"
         assert item["origin"] == "wechat"
         assert item["text"] == "微信刚发来的内容"
         assert item["quote"] == {
-            "id": None,
-            "direction": None,
+            "message_id": "wechat-event-original",
             "type": "text",
-            "text": "瓷器",
-            "file_name": None,
+            "text": "测试",
             "title": "微信桥接",
         }
         assert "owner-user" not in history.text
+
+
+async def test_wechat_quote_of_admin_outbound_recovers_clickable_original(
+    tmp_path: Path,
+) -> None:
+    """模拟微信引用网页发出的消息，并校验历史接口返回原文定位 ID。"""
+
+    async with _running_client(tmp_path) as (client, app, _gateway):
+        await _seed_owner(app)
+        page = await client.get("/admin", headers=WEB_BASIC)
+        token = _extract_admin_token(page.text)
+        sent = await client.post(
+            "/admin/api/messages",
+            headers={**WEB_BASIC, "X-Admin-Token": token},
+            json={"type": "text", "text": "你好"},
+        )
+        sent_id = sent.json()["id"]
+        server_reference = "server-item-reference"
+        await app.state.dispatcher.publish(
+            InboundEvent(
+                event_id="wechat-quotes-admin-message",
+                occurred_at=utc_now() + timedelta(seconds=1),
+                sender=InboundSender(user_id="owner-user"),
+                message=InboundMessageBody(type="text", text="你好"),
+                quote=InboundQuote(
+                    title="微信原生引用",
+                    text="",
+                    protocol_item_id=server_reference,
+                ),
+            )
+        )
+
+        for _attempt in range(50):
+            history = await client.get("/admin/api/messages", headers=WEB_BASIC)
+            if len(history.json()["items"]) == 2:
+                break
+            await asyncio.sleep(0.01)
+
+        quoted_reply = history.json()["items"][1]
+        assert quoted_reply["quote"] == {
+            "message_id": sent_id,
+            "type": "text",
+            "text": "你好",
+            "title": "微信原生引用",
+        }
 
 
 async def test_inbound_downloaded_media_is_exposed_only_by_protected_link(

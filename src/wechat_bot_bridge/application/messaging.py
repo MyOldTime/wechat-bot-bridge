@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import replace
 
 from ..domain.errors import (
     BridgeError,
@@ -11,16 +12,15 @@ from ..domain.errors import (
     GatewayTemporaryError,
     MissingContextError,
     OwnerNotBoundError,
-    QuotedMessageNotFoundError,
 )
 from ..domain.models import (
-    ConversationQuote,
     MessageOrigin,
     OutboundMessage,
     OutboundPayload,
     OwnerBinding,
     TypingCancelPayload,
     TypingStartPayload,
+    WeChatDeliveryReceipt,
     outbound_payload_type,
 )
 from ..domain.ports import (
@@ -28,7 +28,6 @@ from ..domain.ports import (
     OutboundMessageStore,
     WeChatGateway,
 )
-from .bridge_quotes import quote_from_message, with_bridge_quote
 from .payloads import PayloadLimits, validate_outbound_payload
 
 logger = logging.getLogger(__name__)
@@ -62,30 +61,32 @@ class NotificationService:
         *,
         payload: OutboundPayload,
         origin: MessageOrigin,
-        quote_message_id: str | None = None,
     ) -> OutboundMessage:
         validate_outbound_payload(payload, self._payload_limits)
 
         async with self._operation_lock:
             target = await self._resolve_delivery_target()
-            quote = await self._resolve_quote(quote_message_id)
-            delivery_payload = with_bridge_quote(payload, quote)
-            validate_outbound_payload(delivery_payload, self._payload_limits)
             message = await self._store.begin_outbound(
                 user_id=target.user_id,
                 message_type=outbound_payload_type(payload),
                 payload=payload,
                 origin=origin,
-                quote_message_id=quote_message_id,
             )
             await self._publish_stored_message(message.id)
-            await self._deliver(
+            receipt = await self._deliver(
                 message=message,
-                payload=delivery_payload,
+                payload=payload,
                 user_id=target.user_id,
                 context_token=target.context_token,
             )
-            sent = await self._store.mark_outbound_sent(message.id)
+            sent = await self._store.mark_outbound_sent(
+                message.id,
+                protocol_item_id=receipt.protocol_item_id,
+            )
+            sent = replace(
+                sent,
+                wechat_message_id=receipt.wechat_message_id,
+            )
             await self._publish_success(
                 message=sent,
                 payload=payload,
@@ -117,17 +118,6 @@ class NotificationService:
             raise MissingContextError("The owner must send the bot a new message first")
         return target
 
-    async def _resolve_quote(
-        self,
-        message_id: str | None,
-    ) -> ConversationQuote | None:
-        if message_id is None:
-            return None
-        message = await self._store.get_conversation_message(message_id)
-        if message is None:
-            raise QuotedMessageNotFoundError("The quoted conversation message was not found")
-        return quote_from_message(message)
-
     async def _deliver(
         self,
         *,
@@ -135,11 +125,12 @@ class NotificationService:
         payload: OutboundPayload,
         user_id: str,
         context_token: str,
-    ) -> None:
+    ) -> WeChatDeliveryReceipt:
         """执行一次上游调用，并保证失败状态不会遗留为 sending。"""
 
         try:
-            await self._gateway.send_message(
+            return await self._gateway.send_message(
+                message_id=message.id,
                 user_id=user_id,
                 payload=payload,
                 context_token=context_token,

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -13,7 +13,6 @@ from wechat_bot_bridge.domain.errors import (
     GatewayNotReadyError,
     GatewayTemporaryError,
     OwnerNotBoundError,
-    QuotedMessageNotFoundError,
 )
 from wechat_bot_bridge.domain.models import (
     ConversationMessage,
@@ -23,15 +22,19 @@ from wechat_bot_bridge.domain.models import (
     ImagePayload,
     InboundEvent,
     InboundMessageBody,
+    InboundQuote,
     InboundSender,
     MessageOrigin,
     OutboundPayload,
     OutboundStatus,
     TextPayload,
+    WeChatDeliveryReceipt,
 )
-from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore
+from wechat_bot_bridge.domain.references import scoped_protocol_item_id
+from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore, utc_now
 
 SESSION = "session-a"
+ACCOUNT_ID = "account-1"
 
 
 class FakeGateway:
@@ -41,11 +44,13 @@ class FakeGateway:
         session_fingerprint: str | None = SESSION,
         outcomes: list[Exception | None] | None = None,
         delay: float = 0,
+        protocol_item_id: str | None = None,
     ) -> None:
         self._session_fingerprint = session_fingerprint
         self._outcomes = list(outcomes or [])
         self._delay = delay
-        self.calls: list[tuple[str, OutboundPayload, str]] = []
+        self._protocol_item_id = protocol_item_id
+        self.calls: list[tuple[str, str, OutboundPayload, str]] = []
         self.active_sends = 0
         self.max_active_sends = 0
 
@@ -70,11 +75,12 @@ class FakeGateway:
     async def send_message(
         self,
         *,
+        message_id: str,
         user_id: str,
         payload: OutboundPayload,
         context_token: str,
-    ) -> None:
-        self.calls.append((user_id, payload, context_token))
+    ) -> WeChatDeliveryReceipt:
+        self.calls.append((message_id, user_id, payload, context_token))
         self.active_sends += 1
         self.max_active_sends = max(self.max_active_sends, self.active_sends)
         try:
@@ -86,6 +92,10 @@ class FakeGateway:
                     raise outcome
         finally:
             self.active_sends -= 1
+        return WeChatDeliveryReceipt(
+            wechat_message_id="server-message-1",
+            protocol_item_id=self._protocol_item_id,
+        )
 
 
 class CapturePublisher:
@@ -180,6 +190,10 @@ async def test_each_request_is_distinct_and_publishes_sending_then_sent(
         assert first.id != second.id
         assert first.status is OutboundStatus.SENT
         assert second.status is OutboundStatus.SENT
+        assert first.wechat_message_id == "server-message-1"
+        persisted = await store.get_outbound(first.id)
+        assert persisted is not None
+        assert persisted.wechat_message_id is None
         assert first.sent_at is not None
         assert [message.status for message in publisher.messages] == [
             ConversationStatus.SENDING,
@@ -188,8 +202,18 @@ async def test_each_request_is_distinct_and_publishes_sending_then_sent(
             ConversationStatus.SENT,
         ]
         assert gateway.calls == [
-            ("user-1", TextPayload(text="task complete"), "private-context"),
-            ("user-1", TextPayload(text="task complete"), "private-context"),
+            (
+                first.id,
+                "user-1",
+                TextPayload(text="task complete"),
+                "private-context",
+            ),
+            (
+                second.id,
+                "user-1",
+                TextPayload(text="task complete"),
+                "private-context",
+            ),
         ]
     finally:
         await store.close()
@@ -217,6 +241,44 @@ async def test_gateway_failure_is_returned_immediately_and_published(
             ConversationStatus.SENDING,
             ConversationStatus.FAILED,
         ]
+    finally:
+        await store.close()
+
+
+async def test_wechat_quote_of_outbound_message_recovers_web_original(
+    tmp_path: Path,
+) -> None:
+    """覆盖“微信引用 Bot 消息，但上游省略原文”的真实回归场景。"""
+
+    store = await _store_with_owner(tmp_path)
+    server_reference = scoped_protocol_item_id(ACCOUNT_ID, "server-item-100")
+    assert server_reference is not None
+    service = _service(
+        store,
+        FakeGateway(protocol_item_id=server_reference),
+    )
+    try:
+        sent = await service.send(
+            payload=TextPayload(text="你好"),
+            origin=MessageOrigin.WEB_ADMIN,
+        )
+        reply = await store.record_inbound_conversation(
+            InboundEvent(
+                event_id="wechat-quoted-reply",
+                occurred_at=utc_now() + timedelta(seconds=1),
+                sender=InboundSender(user_id="user-1"),
+                message=InboundMessageBody(type="text", text="你好"),
+                quote=InboundQuote(
+                    title="微信原生引用",
+                    text="",
+                    protocol_item_id=server_reference,
+                ),
+            )
+        )
+
+        assert reply.quote is not None
+        assert reply.quote.target_message_id == sent.id
+        assert reply.quote.text == "你好"
     finally:
         await store.close()
 
@@ -269,85 +331,5 @@ async def test_payload_validation_happens_before_creating_chat_record(
 
         page = await store.list_conversation_messages(cursor=None, limit=10)
         assert page.items == ()
-    finally:
-        await store.close()
-
-
-async def test_bridge_quote_is_persisted_and_explicit_prefix_is_sent(
-    tmp_path: Path,
-) -> None:
-    store = await _store_with_owner(tmp_path)
-    gateway = FakeGateway()
-    service = _service(store, gateway)
-    inbound = InboundEvent(
-        event_id="incoming-to-quote",
-        occurred_at=datetime.now(UTC),
-        sender=InboundSender(user_id="user-1"),
-        message=InboundMessageBody(type="text", text="原始微信消息"),
-    )
-    try:
-        await store.record_inbound_conversation(inbound)
-        sent = await service.send(
-            payload=TextPayload(text="这是回复"),
-            origin=MessageOrigin.WEB_ADMIN,
-            quote_message_id=inbound.event_id,
-        )
-
-        assert gateway.calls == [
-            (
-                "user-1",
-                TextPayload(text="【桥接引用·对方】原始微信消息\n这是回复"),
-                "private-context",
-            )
-        ]
-        stored = await store.get_conversation_message(sent.id)
-        assert stored is not None
-        assert stored.text == "这是回复"
-        assert stored.quote is not None
-        assert stored.quote.id == inbound.event_id
-        assert stored.quote.text == "原始微信消息"
-    finally:
-        await store.close()
-
-
-async def test_missing_bridge_quote_is_rejected_before_creating_message(
-    tmp_path: Path,
-) -> None:
-    store = await _store_with_owner(tmp_path)
-    gateway = FakeGateway()
-    service = _service(store, gateway)
-    try:
-        with pytest.raises(QuotedMessageNotFoundError):
-            await service.send(
-                payload=TextPayload(text="不会发送"),
-                origin=MessageOrigin.WEB_ADMIN,
-                quote_message_id="missing-message",
-            )
-
-        assert gateway.calls == []
-        assert (await store.list_conversation_messages(cursor=None, limit=10)).items == ()
-    finally:
-        await store.close()
-
-
-async def test_bridge_quote_does_not_duplicate_media_placeholder(tmp_path: Path) -> None:
-    store = await _store_with_owner(tmp_path)
-    gateway = FakeGateway()
-    service = _service(store, gateway)
-    inbound = InboundEvent(
-        event_id="incoming-image-to-quote",
-        occurred_at=datetime.now(UTC),
-        sender=InboundSender(user_id="user-1"),
-        message=InboundMessageBody(type="image", text="[图片]"),
-    )
-    try:
-        await store.record_inbound_conversation(inbound)
-        await service.send(
-            payload=TextPayload(text="收到"),
-            origin=MessageOrigin.WEB_ADMIN,
-            quote_message_id=inbound.event_id,
-        )
-
-        assert gateway.calls[0][1] == TextPayload(text="【桥接引用·对方】[图片]\n收到")
     finally:
         await store.close()

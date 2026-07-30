@@ -152,6 +152,10 @@ class SendMessageResponse(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     id: str
+    msg_id: str | None = Field(
+        default=None,
+        description=("微信服务端为主消息分配的 ID；输入状态或上游未返回 ID 时为 null"),
+    )
     message_type: OutboundMessageType = Field(serialization_alias="type")
     status: Literal["sent"]
     created_at: datetime
@@ -163,6 +167,7 @@ class SendMessageResponse(BaseModel):
             raise ValueError("Only a sent message can be returned as a success response")
         return cls(
             id=message.id,
+            msg_id=message.wechat_message_id,
             message_type=message.message_type,
             status="sent",
             created_at=message.created_at,

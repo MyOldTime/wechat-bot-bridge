@@ -26,10 +26,8 @@ class CaptureNotifications:
         *,
         payload: OutboundPayload,
         origin: MessageOrigin,
-        quote_message_id: str | None = None,
     ) -> OutboundMessage:
         assert origin is MessageOrigin.WEB_ADMIN
-        assert quote_message_id is None
         self.payloads.append(payload)
         now = datetime.now(UTC)
         return OutboundMessage(

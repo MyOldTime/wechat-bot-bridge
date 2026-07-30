@@ -118,8 +118,15 @@ class ILinkTransport:
         self,
         credentials: Credentials,
         message: dict[str, Any],
-    ) -> None:
-        await self._request_json(
+    ) -> str | None:
+        """发送消息并返回微信实际分配的消息 ID。
+
+        腾讯公开的 TypeScript 类型暂未声明 ``message_id``，但线上
+        ``sendmessage`` 成功响应会返回该整数；微信引用中的
+        ``MessageItem.msg_id`` 使用同一个值。
+        """
+
+        payload = await self._request_json(
             method="POST",
             base_url=credentials.base_url,
             endpoint="/ilink/bot/sendmessage",
@@ -128,6 +135,7 @@ class ILinkTransport:
             body={"msg": message, "base_info": _base_info()},
             timeout_seconds=_API_TIMEOUT_SECONDS,
         )
+        return _response_message_id(payload)
 
     async def get_config(
         self,
@@ -412,6 +420,16 @@ def _response_error_code(payload: dict[str, Any]) -> int:
     if isinstance(ret, int) and not isinstance(ret, bool) and ret != 0:
         return ret
     return 0
+
+
+def _response_message_id(payload: dict[str, Any]) -> str | None:
+    """规范化线上响应的消息 ID；缺失时仍视为已成功发送。"""
+
+    value = payload.get("message_id")
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    normalized = str(value).strip()
+    return normalized if 0 < len(normalized) <= 256 else None
 
 
 def _validate_https_url(value: str, *, label: str) -> str:

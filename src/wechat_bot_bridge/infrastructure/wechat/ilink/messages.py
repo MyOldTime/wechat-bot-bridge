@@ -6,7 +6,6 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
 
 from .errors import ILinkProtocolError
 from .models import (
@@ -58,16 +57,17 @@ def chunk_text(text: str, limit: int = 4000) -> tuple[str, ...]:
 
 def build_message(
     *,
+    message_id: str,
     user_id: str,
     context_token: str,
     item: dict[str, Any],
 ) -> dict[str, Any]:
-    """构造腾讯 `SendMessageReq.msg` 对象。"""
+    """构造腾讯 `SendMessageReq.msg`，为每个请求固定本地 client ID。"""
 
     return {
         "from_user_id": "",
         "to_user_id": user_id,
-        "client_id": f"wechat-bot-bridge-{uuid4()}",
+        "client_id": message_id,
         "message_type": int(WireMessageType.BOT),
         "message_state": int(WireMessageState.FINISH),
         "context_token": context_token,
@@ -184,6 +184,8 @@ def parse_incoming_message(raw: dict[str, Any]) -> IncomingMessage | None:
         text=_extract_text(items),
         type=message_type,
         timestamp=timestamp,
+        message_id=_message_id(raw),
+        item_id=_item_id(items),
         media=tuple(media),
         quoted_message=_parse_quote(items),
     )
@@ -202,6 +204,29 @@ def _upstream_id(raw: dict[str, Any]) -> str:
         default=str,
     ).encode("utf-8")
     return f"digest:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _message_id(raw: dict[str, Any]) -> str | None:
+    """提取官方 ``WeixinMessage.message_id``，供入站引用的精确关联使用。"""
+
+    value = raw.get("message_id")
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    normalized = str(value).strip()
+    return normalized if 0 < len(normalized) <= 256 else None
+
+
+def _item_id(items: list[dict[str, Any]]) -> str | None:
+    """提取官方 ``MessageItem.msg_id``，只接受有界的标量标识。"""
+
+    for item in items:
+        value = item.get("msg_id")
+        if isinstance(value, bool) or not isinstance(value, (str, int)):
+            continue
+        normalized = str(value).strip()
+        if 0 < len(normalized) <= 256:
+            return normalized
+    return None
 
 
 def _parse_timestamp(value: object) -> datetime:
@@ -307,6 +332,7 @@ def _voice_format(detail: dict[str, Any]) -> str:
 
 
 def _parse_quote(items: list[dict[str, Any]]) -> QuotedMessage | None:
+    partial_reference: QuotedMessage | None = None
     for item in items:
         raw_reference = item.get("ref_msg")
         if not isinstance(raw_reference, dict):
@@ -321,10 +347,20 @@ def _parse_quote(items: list[dict[str, Any]]) -> QuotedMessage | None:
                 text = file_detail["file_name"]
         title = raw_reference.get("title")
         normalized_title = title if isinstance(title, str) and title else None
-        if normalized_title is not None or text or quote_type != "text":
-            return QuotedMessage(
-                title=normalized_title,
-                text=text,
-                type=quote_type,
-            )
-    return None
+        quote = QuotedMessage(
+            title=normalized_title,
+            text=text,
+            type=quote_type,
+            item_id=_item_id([reference_item]),
+        )
+        if (
+            normalized_title is not None
+            or text
+            or quote_type != "text"
+            or quote.item_id is not None
+        ):
+            return quote
+        # iLink 对部分媒体引用只返回空的 message_item。保留 ref_msg 的存在，
+        # 让管理页面至少能明确展示“微信原生引用”，而不是把引用静默丢失。
+        partial_reference = quote
+    return partial_reference

@@ -8,6 +8,7 @@ import logging
 from typing import Final, Protocol
 
 from ...domain.models import (
+    ConversationMessageType,
     InboundEvent,
     InboundMedia,
     InboundMessageBody,
@@ -15,6 +16,7 @@ from ...domain.models import (
     InboundSender,
 )
 from ...domain.ports import InboundPublisher, WeChatStateStore
+from ...domain.references import scoped_protocol_item_id
 from .ilink.errors import ILinkMediaError
 from .ilink.media import downloaded_media_mime, downloaded_media_name
 from .ilink.models import Credentials, DownloadedMedia, IncomingMessage
@@ -70,7 +72,6 @@ class InboundMessageProcessor:
                 extra={"message_type": message.type},
             )
             return
-
         await self._store.save_owner_context(
             user_id=message.user_id,
             context_token=message.context_token,
@@ -130,8 +131,12 @@ def normalize_inbound_event(
     if message.quoted_message is not None:
         quote = InboundQuote(
             title=message.quoted_message.title,
-            type=message.quoted_message.type,
+            type=ConversationMessageType(message.quoted_message.type),
             text=message.quoted_message.text,
+            protocol_item_id=scoped_protocol_item_id(
+                account_id,
+                message.quoted_message.item_id,
+            ),
         )
     return InboundEvent(
         event_id=event_id,
@@ -142,6 +147,8 @@ def normalize_inbound_event(
             text=normalized_inbound_text(message),
         ),
         quote=quote,
+        protocol_item_id=scoped_protocol_item_id(account_id, message.item_id),
+        protocol_message_id=scoped_protocol_item_id(account_id, message.message_id),
     )
 
 

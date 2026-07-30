@@ -48,30 +48,40 @@ class ILinkClient:
     async def send_text(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         text: str,
-    ) -> None:
-        for chunk in chunk_text(text):
-            await self._transport.send_message(
+    ) -> str | None:
+        primary_message_id: str | None = None
+        for index, chunk in enumerate(chunk_text(text)):
+            # 每个协议请求必须有唯一 ID；首段沿用本地消息 ID，便于引用主消息。
+            chunk_message_id = message_id if index == 0 else f"{message_id}:part:{index + 1}"
+            server_message_id = await self._transport.send_message(
                 self._credentials,
                 build_message(
+                    message_id=chunk_message_id,
                     user_id=user_id,
                     context_token=context_token,
                     item=build_text_item(chunk),
                 ),
             )
+            if index == 0:
+                primary_message_id = server_message_id
+        return primary_message_id
 
     async def send_image(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         data: bytes,
         caption: str | None,
-    ) -> None:
+    ) -> str | None:
         if caption:
             await self.send_text(
+                message_id=f"{message_id}:caption",
                 user_id=user_id,
                 context_token=context_token,
                 text=caption,
@@ -82,9 +92,10 @@ class ILinkClient:
             data=data,
             media_type=UploadMediaType.IMAGE,
         )
-        await self._transport.send_message(
+        return await self._transport.send_message(
             self._credentials,
             build_message(
+                message_id=message_id,
                 user_id=user_id,
                 context_token=context_token,
                 item=build_image_item(
@@ -98,14 +109,16 @@ class ILinkClient:
     async def send_file(
         self,
         *,
+        message_id: str,
         user_id: str,
         context_token: str,
         data: bytes,
         file_name: str,
         caption: str | None,
-    ) -> None:
+    ) -> str | None:
         if caption:
             await self.send_text(
+                message_id=f"{message_id}:caption",
                 user_id=user_id,
                 context_token=context_token,
                 text=caption,
@@ -116,9 +129,10 @@ class ILinkClient:
             data=data,
             media_type=UploadMediaType.FILE,
         )
-        await self._transport.send_message(
+        return await self._transport.send_message(
             self._credentials,
             build_message(
+                message_id=message_id,
                 user_id=user_id,
                 context_token=context_token,
                 item=build_file_item(

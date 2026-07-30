@@ -83,6 +83,23 @@ async def test_api_error_exposes_codes_but_not_upstream_payload() -> None:
     assert "private-context" not in str(caught.value)
 
 
+async def test_send_message_returns_server_message_id() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"message_id": 9_223_372_036_854_000})
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    transport = ILinkTransport(http_client=http_client)
+    try:
+        message_id = await transport.send_message(
+            _credentials(),
+            {"item_list": [{"type": 1, "text_item": {"text": "hello"}}]},
+        )
+    finally:
+        await http_client.aclose()
+
+    assert message_id == "9223372036854000"
+
+
 async def test_long_poll_read_timeout_is_a_normal_empty_batch() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("normal long-poll timeout", request=request)

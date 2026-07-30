@@ -2,17 +2,17 @@
 
 ## 1. 目标
 
-项目直接实现微信 iLink Bot 所需的最小协议，不再安装或导入
-`wechatbot-sdk`。这样可以把授权文件、长轮询 cursor、owner 上下文、媒体
-大小限制和错误脱敏全部纳入本仓库的测试与维护边界，同时不让 iLink 原始
-JSON 扩散到领域、HTTP API 或管理页面。
+项目直接实现微信 iLink Bot 所需的最小协议，不安装或导入
+`wechatbot-sdk`。授权文件、长轮询 cursor、owner 上下文、媒体大小限制和
+错误脱敏均由本仓库测试和维护，iLink 原始 JSON 不扩散到领域、HTTP API
+或管理页面。
 
 该实现仍然是 iLink Bot 客户端，不是桌面微信 Hook。当前产品能力边界没有
 因此扩大：通道仍是扫码账号与 Bot 的一对一私聊。
 
 ## 2. 参考来源
 
-本次实现于 2026-07-29 核对：
+协议实现依据：
 
 - 腾讯官方实现
   [`Tencent/openclaw-weixin`](https://github.com/Tencent/openclaw-weixin)，
@@ -63,7 +63,7 @@ gateway -> inbound / delivery / session / client
 只有 `transport.py` 发起 iLink/CDN HTTP 请求；只有 `messages.py` 解释
 `getupdates` 原始消息字典。
 
-## 4. 已实现端点
+## 4. iLink 端点
 
 | 操作 | iLink 路径 | 用途 |
 | --- | --- | --- |
@@ -91,10 +91,9 @@ iLink-App-ClientVersion: <0x00MMNNPP 的十进制表示>
 `base_info.bot_agent`。token、请求体、完整响应和带查询参数的 CDN URL
 不会写入普通日志。
 
-## 5. 授权兼容
+## 5. 授权文件与登录
 
-默认授权文件仍是 `/data/wechat/credentials.json`。读取同时兼容旧版
-Python SDK 使用的字段：
+授权文件路径是 `/data/wechat/credentials.json`，使用以下 camelCase 字段：
 
 ```json
 {
@@ -106,12 +105,12 @@ Python SDK 使用的字段：
 }
 ```
 
-保存采用同一 camelCase 格式和临时文件原子替换，因此升级本项目不要求
-重新扫码。二维码流程支持 `wait`、`scaned`、`confirmed`、`expired`、
+保存采用 camelCase 格式和临时文件原子替换。二维码流程支持 `wait`、
+`scaned`、`confirmed`、`expired`、
 `need_verifycode`、`verify_code_blocked`、`scaned_but_redirect` 和
 `binded_redirect`。
 
-授权流程由常驻网关和 Basic Auth 管理页面驱动，不再提供交互式 CLI：
+授权流程由常驻网关和 Basic Auth 管理页面驱动：
 
 - 没有凭据时网关停在 `login_required`，直到页面明确请求登录；
 - `qrcode_img_content` 只短暂保存在进程内，Web 层编码为受保护的 SVG，
@@ -126,24 +125,29 @@ Python SDK 使用的字段：
 
 ## 6. 消息和 cursor
 
-- 只把 `message_type=USER` 的消息交给业务层，忽略 Bot 回显；
+- 只把 `message_type=USER` 的消息交给业务层，忽略 `message_type=BOT`；
 - 优先使用 `message_id`，再使用 `client_id`、`seq` 作为上游稳定 ID；
 - 极端情况下缺少全部 ID 时，对原始 JSON 做规范化 SHA-256；
 - 媒体类型由 `MessageItem.type` 决定，即使 CDN 引用缺失也不会降级成文字；
 - 正文只抽取真实 `text_item.text` 和语音转写，不生成 `[image]`，也不拼接
   图片 URL；
-- `ref_msg` 转换成一层 `QuotedMessage` 快照，不伪造历史目标 ID；
-- `ref_msg` 虽位于收发共享的 `MessageItem` 类型中，但腾讯公开发送能力只
-  列出文字、图片、视频和文件，官方发送实现也不构造出站引用。2026-07-29
-  使用真实微信验证时，服务端接受含 `ref_msg` 的请求却只投递正文，因此
-  当前只把它作为入站结构，不宣称支持 Bot 出站原生引用；
+- 当前入站消息的顶层 `WeixinMessage.message_id`、当前 `MessageItem.msg_id` 与 `ref_msg.message_item.msg_id` 分别和账号 ID 一起哈希成隔离的内部关联键；微信引用微信消息时，引用 item ID 可以对应原消息的顶层 message ID，因此 SQLite 用引用键精确匹配原消息的顶层键或 item 键。命中后才回填引用原文并建立管理页目标，不按正文或时间猜测，也不持久化原始协议 ID；
+- iLink 成功响应包含整数 `message_id`，而且它与微信引用该 Bot 消息时返回的
+  `ref_msg.message_item.msg_id` 完全相同。Bot 出站主消息使用内部消息 UUID
+  作为顶层 `client_id`，不伪造 item 的 `msg_id`；传输层解析实际响应，
+  只保存 `(account_id, message_id)` 的哈希。item `msg_id` 由服务端分配，
+  客户端值不能作为引用关联依据；
+- `ref_msg` 转换成一层 `QuotedMessage` 快照；顶层 message ID 和协议 item ID 都不进入去重 JSON、Webhook 或普通日志；
+- `ref_msg` 只作为微信入站结构解析；公共发送请求不接受 Bot 出站引用字段；
 - 新 `get_updates_buf` 只在本批消息全部交给入站处理后写入 SQLite；
 - 重启重放由稳定 `event_id` 和 `inbound_events` 去重，不承诺 exactly-once。
 
-发送文字按不超过 4000 字符的自然边界切片。图片或文件说明先作为文字
-`sendmessage` 发送，再上传和发送媒体项；因此说明成功、媒体失败时可能
-出现部分提交，调用方仍会收到媒体发送失败。管理端引用使用明确标记的普通
-文本降级，并在 SQLite 中保留结构化关系。
+发送文字按不超过 4000 字符的自然边界切片。首段 `client_id` 使用内部消息 UUID，后续
+分段使用带序号的唯一 ID。图片或文件说明先用带 `:caption` 后缀的 ID 作为
+文字 `sendmessage` 发送，媒体主项使用内部消息 UUID；因此说明成功、媒体
+失败时可能出现部分提交，调用方仍会收到媒体发送失败。服务只把主项关联到
+一条本地聊天记录。管理页面和外部接口都不提供出站引用字段；`ref_msg`
+仅在微信入站消息中解析并保存快照。
 
 ## 7. CDN 与 AES
 
@@ -164,7 +168,7 @@ Python SDK 使用的字段：
 
 下载先检查 `Content-Length`，再逐块累计密文字节；超过
 `WBB_MEDIA_MAX_BYTES + 16` 立即终止。解密后再次检查明文上限。少量不带
-key 的历史图片按腾讯官方实现兼容为 CDN 明文，其他无 key 媒体拒绝处理。
+key 的图片按腾讯官方实现作为 CDN 明文处理，其他无 key 媒体拒绝处理。
 
 ## 8. 错误与重试
 
@@ -176,14 +180,14 @@ key 的历史图片按腾讯官方实现兼容为 CDN 明文，其他无 key 媒
 - CDN 上传只对网络错误和 5xx 做最多三次尝试，4xx 立即失败；
 - 出站 `sendmessage` 不自动重试，避免产生重复通知。
 
-## 9. 升级审计
+## 9. 协议变更检查
 
 升级协议实现前必须：
 
 1. 记录核对的腾讯提交或版本；
 2. 比较端点、认证头、`BaseInfo`、错误码和请求超时；
 3. 比较 `WeixinMessage`、`MessageItem`、引用和 CDN 字段；
-4. 验证旧授权文件仍能读取；
+4. 验证授权文件格式和敏感文件权限；
 5. 更新 transport/messages/media/auth 的离线契约测试；
 6. 使用测试账号人工验证扫码、入站文字/图片/文件/引用、出站文字/图片/
    文件和输入状态；

@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from enum import StrEnum
-from typing import Literal
+from typing import Literal, Never
 
 from ...core.config import Settings
 from ...domain.errors import (
@@ -19,8 +19,10 @@ from ...domain.models import (
     GatewayPhase,
     GatewayStatus,
     OutboundPayload,
+    WeChatDeliveryReceipt,
 )
 from ...domain.ports import InboundPublisher, WeChatStateStore
+from ...domain.references import scoped_protocol_item_id
 from .delivery import deliver_outbound_payload
 from .ilink.auth import CredentialStore, QRAuthenticator
 from .ilink.client import ILinkClient
@@ -384,10 +386,11 @@ class WeChatILinkGateway:
     async def send_message(
         self,
         *,
+        message_id: str,
         user_id: str,
         payload: OutboundPayload,
         context_token: str,
-    ) -> None:
+    ) -> WeChatDeliveryReceipt:
         client = self._client
         credentials = self._credentials
         if (
@@ -405,11 +408,22 @@ class WeChatILinkGateway:
             )
 
         try:
-            await deliver_outbound_payload(
+            server_message_id = await deliver_outbound_payload(
                 client,
+                message_id=message_id,
                 user_id=user_id,
                 context_token=context_token,
                 payload=payload,
+            )
+            protocol_item_id = scoped_protocol_item_id(
+                credentials.account_id,
+                server_message_id,
+            )
+            if server_message_id is not None and protocol_item_id is None:
+                logger.warning("微信发送成功，但服务端消息 ID 无法规范化")
+            return WeChatDeliveryReceipt(
+                wechat_message_id=server_message_id,
+                protocol_item_id=protocol_item_id,
             )
         except ILinkApiError as exc:
             self._raise_gateway_api_error(exc)
@@ -584,7 +598,7 @@ class WeChatILinkGateway:
         except (ILinkApiError, ILinkNetworkError, ILinkProtocolError, TimeoutError):
             logger.warning("关闭连接时发送微信停止通知失败")
 
-    def _raise_gateway_api_error(self, error: ILinkApiError) -> None:
+    def _raise_gateway_api_error(self, error: ILinkApiError) -> Never:
         if error.errcode == -2:
             raise GatewayRejectedError(
                 "The context may be stale or WeChat may be rate limiting messages"

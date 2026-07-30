@@ -117,17 +117,25 @@ class OutboundMessage:
     created_at: datetime
     updated_at: datetime
     sent_at: datetime | None
+    # 只在当前同步发送响应中携带，不从 SQLite 恢复或持久化原始协议 ID。
+    wechat_message_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class WeChatDeliveryReceipt:
+    """微信同步发送结果；原始 ID 仅供当前受认证调用方使用。"""
+
+    wechat_message_id: str | None
+    protocol_item_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
 class ConversationQuote:
-    """聊天记录引用的目标快照，不递归展开目标自身的引用。"""
+    """微信入站原生引用；目标 ID 仅在协议标识精确匹配时存在。"""
 
-    id: str | None
-    direction: ConversationDirection | None
+    target_message_id: str | None
     message_type: ConversationMessageType
     text: str
-    file_name: str | None
     title: str | None
 
 
@@ -184,8 +192,14 @@ class InboundQuote(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     title: str | None = None
-    type: Literal["text", "image", "voice", "file", "video"] = "text"
+    type: ConversationMessageType = ConversationMessageType.TEXT
     text: str
+    protocol_item_id: str | None = Field(
+        default=None,
+        max_length=256,
+        exclude=True,
+        repr=False,
+    )
 
 
 class InboundMedia(BaseModel):
@@ -210,6 +224,20 @@ class InboundEvent(BaseModel):
     sender: InboundSender
     message: InboundMessageBody
     quote: InboundQuote | None = None
+    protocol_item_id: str | None = Field(
+        default=None,
+        max_length=256,
+        exclude=True,
+        repr=False,
+    )
+    # 微信入站引用可能用顶层 message_id 指向原消息，而不是原消息项的 msg_id。
+    # 两个值均只保存账号隔离后的哈希，不进入 Webhook 或普通序列化结果。
+    protocol_message_id: str | None = Field(
+        default=None,
+        max_length=256,
+        exclude=True,
+        repr=False,
+    )
     media: InboundMedia | None = Field(default=None, exclude=True)
 
 

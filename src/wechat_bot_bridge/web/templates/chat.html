@@ -147,15 +147,6 @@
         </div>
 
         <form id="composer" class="composer">
-          <div id="quote-preview" class="quote-preview" hidden>
-            <div class="quote-preview-mark" aria-hidden="true">↩</div>
-            <div class="quote-preview-copy">
-              <strong id="quote-preview-title">桥接引用消息</strong>
-              <span id="quote-preview-text"></span>
-            </div>
-            <button id="remove-quote" type="button" aria-label="取消引用">×</button>
-          </div>
-
           <div id="attachment-preview" class="attachment-preview" hidden>
             <div class="attachment-icon" aria-hidden="true">📎</div>
             <div>
@@ -183,7 +174,6 @@
               </label>
               <input id="attachment-input" type="file" hidden>
               <span id="character-count" class="character-count">0 / {{ message_max_chars }}</span>
-              <span class="quote-hint">右键消息可桥接引用</span>
             </div>
             <button id="send-button" class="send-button" type="submit" disabled>
               <span>发送</span>
@@ -197,12 +187,6 @@
       </section>
     </main>
 
-    <div id="message-context-menu" class="message-context-menu" role="menu" hidden>
-      <button id="quote-message-action" type="button" role="menuitem">
-        <span aria-hidden="true">↩</span>
-        桥接引用此消息
-      </button>
-    </div>
     <div id="toast-region" class="toast-region" aria-live="assertive"></div>
   </body>
 </html>
