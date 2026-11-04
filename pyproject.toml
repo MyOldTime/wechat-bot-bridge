@@ -23,6 +23,9 @@ dependencies = [
 wechat-bot-bridge = "wechat_bot_bridge.bootstrap.cli:main"
 
 [dependency-groups]
+build = [
+    "pyinstaller>=6.21.0,<7",
+]
 dev = [
   "mypy>=1.17.0,<2",
   "pytest>=8.4.0,<10",

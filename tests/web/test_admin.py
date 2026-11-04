@@ -37,11 +37,9 @@ from wechat_bot_bridge.infrastructure.inbound.dispatcher import InboundDispatche
 from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore, utc_now
 from wechat_bot_bridge.infrastructure.realtime.conversation import ResetBroadcast
 
-VALID_API_KEY = "unit-test-api-key-123456"
 WEB_USERNAME = "manager"
 WEB_PASSWORD = "web-test-password-123"
 SESSION = "session-a"
-BEARER = {"Authorization": f"Bearer {VALID_API_KEY}"}
 WEB_BASIC = {
     "Authorization": "Basic "
     + base64.b64encode(f"{WEB_USERNAME}:{WEB_PASSWORD}".encode()).decode("ascii")
@@ -119,7 +117,6 @@ class FakeGateway:
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
     values: dict[str, Any] = {
-        "api_key": VALID_API_KEY,
         "web_username": WEB_USERNAME,
         "web_password": WEB_PASSWORD,
         "data_dir": tmp_path,
@@ -179,6 +176,11 @@ async def _seed_owner(app: FastAPI) -> None:
     )
 
 
+async def _bearer(app: FastAPI) -> dict[str, str]:
+    token = (await app.state.public_api_credentials.current()).token
+    return {"Authorization": f"Bearer {token}"}
+
+
 def _extract_admin_token(html: str) -> str:
     match = re.search(r'<meta name="admin-token" content="([^"]+)">', html)
     assert match is not None
@@ -200,8 +202,9 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
 ) -> None:
     async with _running_client(tmp_path) as (client, app, _gateway):
         await _seed_owner(app)
+        bearer = await _bearer(app)
         missing = await client.get("/admin")
-        bearer_on_web = await client.get("/admin", headers=BEARER)
+        bearer_on_web = await client.get("/admin", headers=bearer)
         page = await client.get("/admin", headers=WEB_BASIC)
         chat_script = await client.get("/admin/static/chat.js", headers=WEB_BASIC)
         chat_style = await client.get("/admin/static/chat.css", headers=WEB_BASIC)
@@ -212,7 +215,7 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
         )
         bearer_on_external = await client.post(
             "/api/v1/messages",
-            headers=BEARER,
+            headers=bearer,
             json={"type": "text", "text": "correct authentication"},
         )
 
@@ -223,6 +226,11 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
         assert "/admin/static/chat.css" in page.text
         assert "/admin/static/chat.js" in page.text
         assert 'id="login-panel"' in page.text
+        assert 'id="open-token-settings"' in page.text
+        assert 'id="open-forwarding-settings"' in page.text
+        assert 'id="public-api-token"' in page.text
+        assert 'id="forwarding-form"' in page.text
+        assert 'type="password" name="password"' not in page.text
         assert 'action="/admin/logout"' in page.text
         assert '<meta name="typing-timeout-seconds" content="5">' in page.text
         assert "桥接引用" not in page.text
@@ -239,6 +247,104 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
         assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
         assert basic_on_external.status_code == 401
         assert bearer_on_external.status_code == 200
+
+
+async def test_admin_manages_public_token_and_live_forwarding_without_password_prompt(
+    tmp_path: Path,
+) -> None:
+    async with _running_client(tmp_path) as (client, app, _gateway):
+        await _seed_owner(app)
+        page = await client.get("/admin", headers=WEB_BASIC)
+        admin_token = _extract_admin_token(page.text)
+
+        unauthorized = await client.get("/admin/api/public-api-token")
+        current = await client.get("/admin/api/public-api-token", headers=WEB_BASIC)
+        old_token = current.json()["token"]
+        old_bearer = {"Authorization": f"Bearer {old_token}"}
+        rotated = await client.post(
+            "/admin/api/public-api-token/rotate",
+            headers={**WEB_BASIC, "X-Admin-Token": admin_token},
+        )
+        new_token = rotated.json()["token"]
+        old_send = await client.post(
+            "/api/v1/messages",
+            headers=old_bearer,
+            json={"type": "text", "text": "旧 Token 不应继续有效"},
+        )
+        new_send = await client.post(
+            "/api/v1/messages",
+            headers={"Authorization": f"Bearer {new_token}"},
+            json={"type": "text", "text": "新 Token 已生效"},
+        )
+
+        default_forwarding = await client.get(
+            "/admin/api/outbound-forwarding",
+            headers=WEB_BASIC,
+        )
+        initial_secret = default_forwarding.json()["secret"]
+        updated = await client.put(
+            "/admin/api/outbound-forwarding",
+            headers={
+                **WEB_BASIC,
+                "X-Admin-Token": admin_token,
+                "Content-Type": "application/json",
+            },
+            json={
+                "enabled": True,
+                "scheme": "http",
+                "host": "LOCALHOST",
+                "port": 9876,
+                "path": "/events",
+                "secret": initial_secret,
+                "timeout_seconds": 4.5,
+                "max_attempts": 2,
+            },
+        )
+        rotated_secret = await client.post(
+            "/admin/api/outbound-forwarding/rotate-secret",
+            headers={**WEB_BASIC, "X-Admin-Token": admin_token},
+        )
+        invalid_target = await client.put(
+            "/admin/api/outbound-forwarding",
+            headers={
+                **WEB_BASIC,
+                "X-Admin-Token": admin_token,
+                "Content-Type": "application/json",
+            },
+            json={
+                "enabled": True,
+                "scheme": "http",
+                "host": "http://invalid.example",
+                "port": 9876,
+                "path": "/events",
+                "secret": initial_secret,
+                "timeout_seconds": 4.5,
+                "max_attempts": 2,
+            },
+        )
+
+        assert unauthorized.status_code == 401
+        assert current.status_code == 200
+        assert current.headers["cache-control"] == "no-store"
+        assert old_token.startswith("wbb_live_")
+        assert current.json()["masked_token"] != old_token
+        assert rotated.status_code == 200
+        assert rotated.headers["cache-control"] == "no-store"
+        assert new_token != old_token
+        assert old_send.status_code == 401
+        assert new_send.status_code == 200
+        assert default_forwarding.status_code == 200
+        assert default_forwarding.json()["enabled"] is False
+        assert default_forwarding.json()["target_url"] == (
+            "http://127.0.0.1:8765/v1/sources/wechat-bridge/events"
+        )
+        assert initial_secret.startswith("wbb_hook_")
+        assert updated.status_code == 200
+        assert updated.headers["cache-control"] == "no-store"
+        assert updated.json()["host"] == "localhost"
+        assert updated.json()["target_url"] == "http://localhost:9876/events"
+        assert rotated_secret.json()["secret"] != initial_secret
+        assert invalid_target.status_code == 422
 
 
 async def test_admin_starts_login_and_serves_qr_without_exposing_raw_url(
@@ -299,6 +405,9 @@ async def test_admin_logout_form_clears_all_state_and_restarts_login(
     )
     async with _running_client(tmp_path) as (client, app, gateway):
         await _seed_owner(app)
+        bearer = await _bearer(app)
+        token_before_logout = (await app.state.public_api_credentials.current()).token
+        forwarding_before_logout = await app.state.forwarding_configuration.current()
         await app.state.store.set_state("cursor:session-a", "private-cursor")
         app.state.settings.credentials_path.write_text(
             '{"token":"fake-test-token"}',
@@ -308,7 +417,7 @@ async def test_admin_logout_form_clears_all_state_and_restarts_login(
         await app.state.dispatcher.drain()
         sent = await client.post(
             "/api/v1/messages",
-            headers=BEARER,
+            headers=bearer,
             json={"type": "text", "text": "也需要被清除"},
         )
         assert sent.status_code == 200
@@ -347,6 +456,8 @@ async def test_admin_logout_form_clears_all_state_and_restarts_login(
         history = await client.get("/admin/api/messages", headers=WEB_BASIC)
         assert history.json()["items"] == []
         assert await app.state.store.remember_inbound_event(inbound) is True
+        assert (await app.state.public_api_credentials.current()).token == token_before_logout
+        assert await app.state.forwarding_configuration.current() == forwarding_before_logout
         status = await client.get("/admin/api/status", headers=WEB_BASIC)
         assert status.json()["phase"] == "logging_in"
         assert status.json()["qr_ready"] is True
@@ -359,14 +470,15 @@ async def test_chat_api_shows_full_content_and_media_only_with_basic_auth(
     encoded = base64.b64encode(png).decode("ascii")
     async with _running_client(tmp_path) as (client, app, _gateway):
         await _seed_owner(app)
+        bearer = await _bearer(app)
         text_response = await client.post(
             "/api/v1/messages",
-            headers=BEARER,
+            headers=bearer,
             json={"type": "text", "text": "自动化任务已完成"},
         )
         image_response = await client.post(
             "/api/v1/messages",
-            headers=BEARER,
+            headers=bearer,
             json={
                 "type": "image",
                 "content_base64": encoded,
@@ -640,9 +752,11 @@ def test_websocket_pushes_external_message_status_changes(tmp_path: Path) -> Non
             subprotocols=["wbb-admin", f"wbb-token.{token}"],
         ) as websocket:
             connected = websocket.receive_json()
+            snapshot = client.portal.call(app.state.public_api_credentials.current)
+            bearer = {"Authorization": f"Bearer {snapshot.token}"}
             response = client.post(
                 "/api/v1/messages",
-                headers=BEARER,
+                headers=bearer,
                 json={"type": "text", "text": "实时展示这条消息"},
             )
             sending = websocket.receive_json()

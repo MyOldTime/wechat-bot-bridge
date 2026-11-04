@@ -14,6 +14,10 @@ from fastapi.staticfiles import StaticFiles
 from ..api.external import build_external_router
 from ..api.health import build_health_router
 from ..application.account import AccountLifecycleService
+from ..application.configuration import (
+    OutboundForwardingConfigurationService,
+    PublicApiCredentialService,
+)
 from ..application.messaging import NotificationService
 from ..application.typing import TypingLeaseService
 from ..core.config import Settings
@@ -22,7 +26,7 @@ from ..infrastructure.inbound.chat_history import ChatHistorySink
 from ..infrastructure.inbound.dispatcher import (
     InboundDispatcher,
     LoggingSink,
-    WebhookSink,
+    OutboundForwardingSink,
 )
 from ..infrastructure.persistence.sqlite import SQLiteStore
 from ..infrastructure.realtime.conversation import ConversationHub
@@ -51,7 +55,7 @@ def create_app(
     *,
     gateway_factory: GatewayFactory | None = None,
 ) -> FastAPI:
-    resolved_settings = settings or Settings()  # type: ignore[call-arg]
+    resolved_settings = settings or Settings()
     factory = gateway_factory or _default_gateway_factory
     conversation_hub = ConversationHub()
     admin_token_signer = AdminTokenSigner(
@@ -65,23 +69,17 @@ def create_app(
         store = SQLiteStore(resolved_settings.database_path)
         await store.open()
 
-        # 聊天记录必须先落库并广播；日志和可选 Webhook 属于后续独立出口。
+        public_api_credentials = PublicApiCredentialService(store)
+        forwarding_configuration = OutboundForwardingConfigurationService(store)
+        await public_api_credentials.initialize()
+        await forwarding_configuration.initialize()
+
+        # 聊天记录必须先落库并广播；日志和单向转发属于后续独立出口。
         sinks: list[InboundSink] = [
             ChatHistorySink(store=store, publisher=conversation_hub),
             LoggingSink(),
+            OutboundForwardingSink(config_provider=forwarding_configuration),
         ]
-        if resolved_settings.inbound_webhook_url is not None:
-            secret = resolved_settings.inbound_webhook_secret
-            if secret is None:  # 正常情况下已由 Settings 校验拦截
-                raise RuntimeError("Webhook secret is missing")
-            sinks.append(
-                WebhookSink(
-                    url=str(resolved_settings.inbound_webhook_url),
-                    secret=secret.get_secret_value(),
-                    timeout_seconds=resolved_settings.webhook_timeout_seconds,
-                    max_attempts=resolved_settings.webhook_max_attempts,
-                )
-            )
         dispatcher = InboundDispatcher(
             sinks,
             queue_size=resolved_settings.inbound_queue_size,
@@ -110,6 +108,8 @@ def create_app(
         )
 
         app.state.store = store
+        app.state.public_api_credentials = public_api_credentials
+        app.state.forwarding_configuration = forwarding_configuration
         app.state.dispatcher = dispatcher
         app.state.gateway = gateway
         app.state.notification_service = service

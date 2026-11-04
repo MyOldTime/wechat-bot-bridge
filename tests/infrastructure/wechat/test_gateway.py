@@ -42,8 +42,6 @@ from wechat_bot_bridge.infrastructure.wechat.ilink.models import (
 )
 from wechat_bot_bridge.infrastructure.wechat.ilink.transport import ILinkTransport
 
-VALID_API_KEY = "unit-test-api-key-123456"
-
 
 class CaptureDispatcher:
     def __init__(self) -> None:
@@ -130,7 +128,6 @@ class FakeClient:
 
 def _settings(tmp_path: Path) -> Settings:
     return Settings(
-        api_key=VALID_API_KEY,
         data_dir=tmp_path,
         database_path=tmp_path / "bridge.db",
         credentials_path=tmp_path / "wechat" / "credentials.json",

@@ -31,8 +31,6 @@ from wechat_bot_bridge.domain.models import (
 from wechat_bot_bridge.infrastructure.inbound.dispatcher import InboundDispatcher
 from wechat_bot_bridge.infrastructure.persistence.sqlite import SQLiteStore
 
-VALID_API_KEY = "unit-test-api-key-123456"
-AUTHORIZATION = {"Authorization": f"Bearer {VALID_API_KEY}"}
 SESSION = "session-a"
 
 
@@ -86,7 +84,6 @@ class FakeGateway:
 
 def _settings(tmp_path: Path, **overrides: Any) -> Settings:
     values: dict[str, Any] = {
-        "api_key": VALID_API_KEY,
         "data_dir": tmp_path,
         "database_path": tmp_path / "bridge.db",
         "credentials_path": tmp_path / "wechat" / "credentials.json",
@@ -138,6 +135,11 @@ async def _seed_owner(
     )
 
 
+async def _authorization(app: FastAPI) -> dict[str, str]:
+    snapshot = await app.state.public_api_credentials.current()
+    return {"Authorization": f"Bearer {snapshot.token}"}
+
+
 def test_openapi_exposes_only_the_single_external_message_endpoint(
     tmp_path: Path,
 ) -> None:
@@ -183,11 +185,13 @@ async def test_external_endpoint_requires_bearer_auth_with_constant_time_compare
         return original_compare_digest(provided, expected)
 
     monkeypatch.setattr(
-        "wechat_bot_bridge.api.security.secrets.compare_digest",
+        "wechat_bot_bridge.application.configuration.secrets.compare_digest",
         recording_compare_digest,
     )
     body = {"type": "text", "text": "task complete"}
     async with _running_client(tmp_path) as (client, app, _gateway):
+        authorization = await _authorization(app)
+        expected_token = (await app.state.public_api_credentials.current()).token
         missing = await client.post("/api/v1/messages", json=body)
         wrong = await client.post(
             "/api/v1/messages",
@@ -195,7 +199,7 @@ async def test_external_endpoint_requires_bearer_auth_with_constant_time_compare
             json=body,
         )
         await _seed_owner(app)
-        correct = await client.post("/api/v1/messages", headers=AUTHORIZATION, json=body)
+        correct = await client.post("/api/v1/messages", headers=authorization, json=body)
 
         assert missing.status_code == 401
         assert missing.headers["www-authenticate"] == "Bearer"
@@ -203,9 +207,9 @@ async def test_external_endpoint_requires_bearer_auth_with_constant_time_compare
         assert wrong.status_code == 401
         assert correct.status_code == 200
         assert calls == [
-            ("", VALID_API_KEY),
-            ("definitely-wrong", VALID_API_KEY),
-            (VALID_API_KEY, VALID_API_KEY),
+            ("", expected_token),
+            ("definitely-wrong", expected_token),
+            (expected_token, expected_token),
         ]
 
 
@@ -214,9 +218,10 @@ async def test_each_external_post_is_a_distinct_synchronous_message(
 ) -> None:
     async with _running_client(tmp_path) as (client, app, gateway):
         await _seed_owner(app)
+        authorization = await _authorization(app)
         request = {"type": "text", "text": "task complete"}
-        # 旧客户端即使继续传相同请求头，每次 POST 仍代表一条新消息。
-        headers = {**AUTHORIZATION, "Idempotency-Key": "legacy-task-1"}
+        # 请求头不参与幂等处理；每次 POST 都代表一条新消息。
+        headers = {**authorization, "Idempotency-Key": "legacy-task-1"}
 
         first = await client.post("/api/v1/messages", headers=headers, json=request)
         repeated = await client.post("/api/v1/messages", headers=headers, json=request)
@@ -270,8 +275,9 @@ async def test_external_endpoint_supports_public_sdk_message_types(
 
     async with _running_client(tmp_path) as (client, app, gateway):
         await _seed_owner(app)
+        authorization = await _authorization(app)
         responses = [
-            await client.post("/api/v1/messages", headers=AUTHORIZATION, json=body)
+            await client.post("/api/v1/messages", headers=authorization, json=body)
             for body, _expected_type in requests
         ]
 
@@ -298,6 +304,7 @@ async def test_external_endpoint_supports_public_sdk_message_types(
 async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> None:
     async with _running_client(tmp_path) as (client, app, gateway):
         await _seed_owner(app)
+        authorization = await _authorization(app)
         bodies = [
             {
                 "type": "voice",
@@ -329,7 +336,7 @@ async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> 
             },
         ]
         responses = [
-            await client.post("/api/v1/messages", headers=AUTHORIZATION, json=body)
+            await client.post("/api/v1/messages", headers=authorization, json=body)
             for body in bodies
         ]
         assert [response.status_code for response in responses] == [422] * len(bodies)
@@ -338,40 +345,41 @@ async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> 
 
 async def test_external_endpoint_maps_application_errors(tmp_path: Path) -> None:
     async with _running_client(tmp_path, message_max_chars=5) as (client, app, gateway):
+        authorization = await _authorization(app)
         blank_message = await client.post(
             "/api/v1/messages",
-            headers=AUTHORIZATION,
+            headers=authorization,
             json={"type": "text", "text": "   "},
         )
         gateway._session_fingerprint = None
         no_session = await client.post(
             "/api/v1/messages",
-            headers=AUTHORIZATION,
+            headers=authorization,
             json={"type": "text", "text": "hello"},
         )
         gateway._session_fingerprint = SESSION
         await app.state.store.activate_session(SESSION)
         unbound = await client.post(
             "/api/v1/messages",
-            headers=AUTHORIZATION,
+            headers=authorization,
             json={"type": "text", "text": "hello"},
         )
         await _seed_owner(app, context_token="")
         missing_context = await client.post(
             "/api/v1/messages",
-            headers=AUTHORIZATION,
+            headers=authorization,
             json={"type": "text", "text": "hello"},
         )
         await _seed_owner(app)
         too_long = await client.post(
             "/api/v1/messages",
-            headers=AUTHORIZATION,
+            headers=authorization,
             json={"type": "text", "text": "123456"},
         )
         gateway.outcomes.append(GatewayTemporaryError("temporary upstream failure"))
         upstream_failure = await client.post(
             "/api/v1/messages",
-            headers=AUTHORIZATION,
+            headers=authorization,
             json={"type": "text", "text": "hello"},
         )
 
@@ -390,13 +398,14 @@ async def test_external_endpoint_maps_application_errors(tmp_path: Path) -> None
 
 
 async def test_removed_external_routes_are_not_available(tmp_path: Path) -> None:
-    async with _running_client(tmp_path) as (client, _app, _gateway):
-        message_list = await client.get("/api/v1/messages", headers=AUTHORIZATION)
-        status_route = await client.get("/api/v1/wechat/status", headers=AUTHORIZATION)
-        recipients = await client.get("/api/v1/recipients", headers=AUTHORIZATION)
+    async with _running_client(tmp_path) as (client, app, _gateway):
+        authorization = await _authorization(app)
+        message_list = await client.get("/api/v1/messages", headers=authorization)
+        status_route = await client.get("/api/v1/wechat/status", headers=authorization)
+        recipients = await client.get("/api/v1/recipients", headers=authorization)
         message_lookup = await client.get(
             "/api/v1/messages/unknown",
-            headers=AUTHORIZATION,
+            headers=authorization,
         )
 
         assert message_list.status_code == 405

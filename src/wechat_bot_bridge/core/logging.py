@@ -13,7 +13,7 @@ from collections.abc import Mapping
 from typing import Final
 
 _CONTEXT_FIELDS: Final[tuple[str, ...]] = (
-    "event_id",
+    "event_id_hash",
     "message_id",
     "message_type",
     "origin",
@@ -26,6 +26,10 @@ _CONTEXT_FIELDS: Final[tuple[str, ...]] = (
     "attempt",
     "max_attempts",
     "retry_delay_seconds",
+    "elapsed_ms",
+    "target_scheme",
+    "target_host",
+    "target_port",
     "sink",
 )
 _LOG_FORMAT: Final[str] = "%(asctime)s %(levelname)s %(name)s %(message)s"

@@ -8,7 +8,7 @@
 POST /api/v1/messages
 ```
 
-它供自动化任务、Hook 和其他程序同步向唯一微信 `owner` 发送消息。`/api/v1` 使用 Bearer API Key；管理页面 `/admin` 使用完全独立的 HTTP Basic Auth。健康检查和页面内部接口不会进入 OpenAPI，因此 `/openapi.json` 只列出上述一个操作。
+它供自动化任务、Hook 和其他程序同步向唯一微信 `owner` 发送消息。`/api/v1` 使用管理页面生成的 Bearer Token；管理页面 `/admin` 使用完全独立的 HTTP Basic Auth。健康检查和页面内部接口不会进入 OpenAPI，因此 `/openapi.json` 只列出上述一个操作。
 
 面向调用方的准备步骤、语言示例、错误处理和重试策略见
 [外部消息接口对接指南](external-api.md)。
@@ -16,7 +16,7 @@ POST /api/v1/messages
 ## 2. 外部认证
 
 ```http
-Authorization: Bearer <WBB_API_KEY>
+Authorization: Bearer <从 /admin 复制的公共 API Token>
 ```
 
 缺失或错误返回：
@@ -35,7 +35,7 @@ WWW-Authenticate: Bearer
 }
 ```
 
-API Key 不得出现在 URL、请求体或日志中。生产环境应通过 TLS、反向代理或私有网络访问。
+Token 首次启动时自动生成并持久化到服务配置表。管理员在 `/admin` 左侧“公共 API Token”页面查看、复制或轮换；轮换后旧 Token 立即失效。Token 不得出现在 URL、请求体或日志中。生产环境应通过 TLS、反向代理或私有网络访问。
 
 ## 3. 发送消息
 
@@ -54,7 +54,7 @@ API Key 不得出现在 URL、请求体或日志中。生产环境应通过 TLS�
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/messages \
-  -H "Authorization: Bearer $WBB_API_KEY" \
+  -H "Authorization: Bearer $BRIDGE_API_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"type":"text","text":"自动化任务已完成"}'
 ```
@@ -127,7 +127,7 @@ Content-Type: application/json
 `id` 是服务内部审计 ID；`msg_id` 是微信 `sendmessage` 实际响应的服务端消息
 ID。文字、图片和文件正常会返回字符串形式的 `msg_id`；输入状态没有聊天
 消息，因此为 `null`。原始 `msg_id` 只出现在本次受 Bearer 认证的同步响应，
-SQLite 仅保存账号隔离哈希，管理历史、Webhook 和普通日志都不会暴露它。
+SQLite 仅保存账号隔离哈希，管理历史、单向转发和普通日志都不会暴露它。
 
 服务只在 iLink 同步接受动作后返回 `200`；它不是客户端展示或已读回执。
 
@@ -174,7 +174,6 @@ Bot 出站引用不属于当前公共契约，服务也不会用拼接文字模�
 ```text
 GET /api/v1/messages
 GET /api/v1/messages/{message_id}
-GET /api/v1/recipients
 GET /api/v1/wechat/status
 ```
 
@@ -231,12 +230,37 @@ WBB_WEB_PASSWORD
 | `POST /admin/api/login` | 启动扫码登录；另需 `X-Admin-Token` |
 | `GET /admin/api/login/qr` | 获取 `no-store` 的二维码 SVG |
 | `POST /admin/api/login/verification` | 提交配对数字；另需 `X-Admin-Token` |
+| `GET /admin/api/public-api-token` | 读取完整公共 Token；响应 `no-store` |
+| `POST /admin/api/public-api-token/rotate` | 轮换公共 Token；另需 `X-Admin-Token` |
+| `GET /admin/api/outbound-forwarding` | 读取单向转发配置和 HMAC Secret；响应 `no-store` |
+| `PUT /admin/api/outbound-forwarding` | 保存并立即应用单向转发配置；另需 `X-Admin-Token` |
+| `POST /admin/api/outbound-forwarding/rotate-secret` | 轮换转发 Secret；另需 `X-Admin-Token` |
 | `POST /admin/logout` | Basic Auth 表单退出并清空全部本地账号数据 |
 | `WS /admin/ws` | 实时会话事件；子协议为 `wbb-admin, wbb-token.<token>` |
 
+Token 和转发 Secret 的读取响应包含完整值，只允许由已经通过 Basic Auth 的
+管理页面调用，并设置 `Cache-Control: no-store`。写操作同时要求页面现有的
+`X-Admin-Token`，登录后不再弹出密码确认。转发配置请求结构：
+
+```json
+{
+  "enabled": true,
+  "scheme": "http",
+  "host": "127.0.0.1",
+  "port": 8765,
+  "path": "/v1/sources/wechat-bridge/events",
+  "secret": "至少 32 字符的 HMAC Secret",
+  "timeout_seconds": 8,
+  "max_attempts": 3
+}
+```
+
+只允许 `http` / `https`；地址字段不接受 userinfo 或完整 URL；路径必须以 `/`
+开头且不能含 query/fragment。保存和轮换均对下一条微信入站事件立即生效。
+
 `POST /admin/logout` 是原生 `application/x-www-form-urlencoded` 表单，隐藏字段 `admin_token` 必须是当前页面签发的短期令牌。Basic Auth 仍由浏览器正常提交，因此跨站页面既不能只依靠浏览器缓存的 Basic 凭据，也不能绕过表单令牌。成功响应为 `303 Location: /admin`。
 
-退出按顺序停止当前授权/长轮询、等待已经入队的入站 Sink 全部结束、删除 `credentials.json`，再事务性删除 `chat_messages`、`inbound_events`、`outbound_messages`、`recipients` 和 `bridge_state`。随后服务广播 `account_reset`、启动一轮新扫码并重定向回管理页。发送与退出共用账号操作锁，因此清理期间不会插入新的出站消息。
+退出按顺序停止当前授权/长轮询、等待已经入队的入站 Sink 全部结束、删除 `credentials.json`，再事务性删除 `chat_messages`、`inbound_events`、`outbound_messages`、`recipients` 和 `bridge_state`。`service_settings` 中的公共 Token 和转发配置不会删除。随后服务广播 `account_reset`、启动一轮新扫码并重定向回管理页。发送与退出共用账号操作锁，因此清理期间不会插入新的出站消息。
 
 页面发送使用与外部接口相同的 `text`、`image`、`file`、`typing_start`、`typing_cancel` 判别类型。管理页面和外部接口均不接受 `quote_msg_id`、`quote_message_id` 或其他出站引用字段；多余字段按请求校验错误返回 `422`。
 
@@ -349,9 +373,15 @@ GET /health/ready
 
 两者公开但隐藏于 OpenAPI。`live` 只表示进程可响应；`ready` 还要求 SQLite、分发器和微信监听处于 `listening`。首次启动等待管理页面扫码、扫码进行中或退出后重新登录时，`ready` 返回 `503 not_ready` 是预期行为。它们不返回账号、消息或凭据内容。
 
-## 7. 入站 Webhook
+## 7. 单向消息转发
 
-配置 `WBB_INBOUND_WEBHOOK_URL` 后，规范化入站事件会由 `WebhookSink` 转发；`WBB_INBOUND_WEBHOOK_SECRET` 必填。
+转发默认关闭。在 `/admin` 左侧“消息转发”页面配置并启用后，规范化微信入站
+事件由 `OutboundForwardingSink` 主动发送到目标 HTTP 服务。页面配置包含
+scheme、host、port、path、HMAC Secret、单次超时和最大尝试次数；保存后
+立即生效，不读取转发相关环境变量。
+
+该功能只发送微信入站事件，不接收目标服务的执行进度或结果。目标服务需要
+通知微信时调用公共 `POST /api/v1/messages`。
 
 请求头：
 
@@ -391,4 +421,8 @@ HMAC-SHA256(secret, timestamp + "." + raw_request_body)
 }
 ```
 
-没有微信原生引用时 `quote` 为 `null`。Webhook 保留 iLink 当次提供的引用快照，不包含内部协议 item ID、管理端目标消息 ID 或仅在 SQLite 历史中完成的原文回填。接收方应使用原始请求体和时间戳验证签名，限制时间偏差，恒定时间比较，并按 `event_id` 去重。credential token、`context_token`、完整 iLink 原始载荷和下载后的媒体字节不会进入 Webhook。媒体仍以 `message.type` 呈现，iLink 媒体占位符会从 `message.text` 清除；二进制只保存在受 Basic Auth 保护的聊天历史中。
+没有微信原生引用时 `quote` 为 `null`。转发事件保留 iLink 当次提供的引用快照，不包含内部协议 item ID、管理端目标消息 ID 或仅在 SQLite 历史中完成的原文回填。接收方应使用原始请求体和时间戳验证签名，限制时间偏差，恒定时间比较，并按 `event_id` 去重。credential token、`context_token`、完整 iLink 原始载荷和下载后的媒体字节不会进入转发请求。媒体仍以 `message.type` 呈现，iLink 媒体占位符会从 `message.text` 清除；二进制只保存在受 Basic Auth 保护的聊天历史中。
+
+转发复用有界进程内入站队列。每个事件最多尝试页面配置的次数，使用有界
+退避且不跟随重定向；进程重启后不续投。转发失败不回滚聊天历史，也不阻塞
+其他 Sink。接收方应快速返回、按 `event_id` 去重，并自行决定是否持久化。

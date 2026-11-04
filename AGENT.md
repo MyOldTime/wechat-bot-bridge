@@ -10,6 +10,7 @@
 - 依赖管理：uv；必须提交并遵守 `uv.lock`
 - CLI：只保留 `wechat-bot-bridge serve`；微信扫码登录由 `/admin` 驱动
 - 外部业务接口：仅 `POST /api/v1/messages`
+- 外部 Bearer Token：首次启动自动生成并保存为服务配置，在 `/admin` 的“公共 API Token”页面查看、复制和轮换
 - 管理页面：`/admin`，使用与外部 Bearer 分离的 Basic Auth
 - 配置前缀：`WBB_`
 - 源码分层：`api/`、`application/`、`bootstrap/`、`core/`、`domain/`、`infrastructure/`、`web/`
@@ -17,12 +18,14 @@
 - Docker 持久化根目录：`/data`
 - 凭据路径：`/data/wechat/credentials.json`
 - 部署模型：单进程、单 Uvicorn worker、单 iLink 长轮询消费者
+- Windows 发布：PyInstaller one-file；无参数 EXE 入口映射到唯一 `serve`，模板和静态资源
+  嵌入程序，持久数据默认位于 `%LOCALAPPDATA%\wechat-bot-bridge`
 
 ## 不可违反的能力边界
 
 本项目基于微信 iLink Bot，不是桌面个人微信 Hook 或客户端注入。不要把功能、文档或测试描述成“监听全部个人微信会话”，也不要声称支持普通个人微信群。当前 ClawBot 是扫码账号与 Bot 之间的一对一私密通道；主动发送只能使用扫码账号先向 Bot 私聊后获得的唯一 owner 会话上下文，不得提供联系人列表、任意 `user_id` 目标或绕过该限制的伪接口。社区观察到主动互动窗口通常约为 24 小时，且窗口内仍有限频；上游 `ret=-2` 可能对应上下文过期或限频，不能硬编码成唯一原因。
 
-`credentials.json` 是明文敏感授权文件。API Key、管理密码、页面令牌、Webhook secret、上游 token 和 `context_token` 不得进入 Git、测试快照、异常响应或日志。不要读取并输出真实 `data/` 内容。示例只能使用明显的假值。聊天正文和媒体只允许出现在 SQLite、微信/Webhook 业务载荷和已通过 Basic Auth 的管理端，不得写入普通日志。
+`credentials.json` 是明文敏感授权文件。公共 API Token、管理密码、页面令牌、转发 HMAC Secret、上游 token 和 `context_token` 不得进入 Git、测试快照、异常响应或日志。公共 API Token 和转发 Secret 只能通过 Basic Auth 保护且 `no-store` 的管理接口显示。不要读取并输出真实 `data/` 内容。示例只能使用明显的假值。聊天正文和媒体只允许出现在 SQLite、微信/单向转发业务载荷和已通过 Basic Auth 的管理端，不得写入普通日志。
 
 ## 架构约束
 
@@ -51,7 +54,7 @@ API/Web/CLI -> application services -> domain ports <- infrastructure adapters
 - 内置解析器生成的 `QuotedMessage` 是微信原生引用的入站快照，必须进入统一事件、SQLite、Webhook 和管理页面。官方入站 `WeixinMessage.message_id`、当前 `MessageItem.msg_id` 和引用目标 `MessageItem.msg_id` 进入领域前必须分别与账号 ID 一起哈希成隔离的内部关联键；SQLite 用引用目标键精确匹配原消息的顶层键或 item 键，命中后管理历史可以回填原文并返回目标消息 ID。不得按正文、时间或方向模糊猜测关联，也不得持久化原始协议 ID 或把关联键暴露到 Webhook。Bot 出站主消息只用内部消息 UUID 作为 iLink 顶层 `client_id`，不得伪造 item 的 `msg_id`；线上 `sendmessage` 成功响应的整数 `message_id` 与微信引用返回的 `MessageItem.msg_id` 相同，传输层必须解析该实际返回值，成功投递后再把账号隔离哈希写入对应出站聊天记录。响应缺少有效 ID 时不得猜测或用时间戳建立关联。
 - 入站非文字媒体只通过内置 `MediaTransfer` 获取，必须同时有网络超时、流式密文上限和 `WBB_MEDIA_MAX_BYTES` 明文上限。内部媒体字段不得序列化到事件去重 JSON、日志或 Webhook；下载失败时仍保留消息类型，正文可以为空。
 - iLink 的 `[image]`、`[voice]`、`[file]`、`[video]` 及中文等价占位符不得作为真实说明重复展示；解析器也不得把图片 URL 人为拼入正文。
-- `ChatHistorySink` 是入站聊天落库和实时广播入口，必须排在日志与可选 Webhook 等后续 Sink 之前。
+- `ChatHistorySink` 是入站聊天落库和实时广播入口，必须排在日志与 `OutboundForwardingSink` 等后续 Sink 之前。单向转发配置由 `/admin` 管理，默认关闭且保存后立即生效。
 - WebSocket 是低延迟提示，不是持久事实来源；慢订阅者可以丢弃较早事件，客户端必须通过 SQLite 历史恢复并按消息 ID upsert。
 - 长轮询中的入站处理保持串行、短小且有超时，不做无限重试；耗时下游处理不得阻塞长轮询。
 - `get_updates_buf` 必须在整批消息处理成功后写入 SQLite；崩溃重放仍必须依靠持久化事件去重，不能假定 exactly-once。
@@ -62,6 +65,10 @@ API/Web/CLI -> application services -> domain ports <- infrastructure adapters
 - 持久层不得把 `context_token` 返回到 API 或 Webhook；除入站 Webhook 契约中的 `sender.user_id` 外，HTTP 业务响应不得暴露 owner 的 `user_id`。
 - 所有后台任务都必须挂到应用 lifespan，支持 SIGTERM 和可预测清理。
 - 保持一个长轮询所有者。没有分布式租约、共享队列和并发数据库设计前，不得启用多个 Uvicorn worker 或多副本。
+- CLI 在打开 SQLite 前必须持有部署数据目录的单实例文件锁；锁文件不得包含 PID 之外的敏感
+  上下文，也不能依赖端口冲突来保护数据库与长轮询。
+- 冻结程序只能把代码、依赖、模板和静态资源放入 one-file；`.env`、SQLite、微信授权、聊天
+  正文和真实 Token 必须留在 EXE 外部。源码/Docker 路径语义不得因冻结发布而改变。
 
 完整说明见 `docs/architecture.md`。
 
@@ -76,6 +83,13 @@ uv run pytest
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy src
+```
+
+Windows EXE 使用独立构建环境，不能为了同步 PyInstaller 而替换正在运行服务的 `.venv`：
+
+```powershell
+.\scripts\build-windows.ps1
+.\scripts\test-windows-release.ps1 -SkipBuild
 ```
 
 新增或更新依赖时使用 `uv add` / `uv remove`，随后提交 `pyproject.toml` 与 `uv.lock`。不要用 `pip install` 手工改变项目环境，不要提交 `.venv`。国内网络可设置：
@@ -105,7 +119,8 @@ UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 - 管理页面键入触发的微信输入状态必须由浏览器定时器和服务端 `TypingLeaseService` 双重收口；正文发送和 lifespan 关闭前应尽力取消活动租约。
 - 管理端与外部发送请求使用相同的消息载荷边界，均不得接受 `quote_msg_id`、`quote_message_id`、`ref_msg` 或其他引用字段。微信入站原生引用只作为只读内容进入历史与实时事件，精确匹配的目标消息 ID 仅用于管理页定位原文。
 - 管理页面 HTTP 全部使用 Basic Auth；外部 Bearer 不得获得管理权限。JSON 写操作另需短期 `X-Admin-Token`；退出使用 URL 编码表单中的短期签名令牌；WebSocket 使用子协议头传递短期签名令牌，不得把令牌放入 URL。
-- `POST /admin/logout` 必须清除授权文件、`chat_messages`、`inbound_events`、`outbound_messages`、`recipients`、`bridge_state` 和进程内页面队列，再启动新的扫码流程并 `303` 返回 `/admin`。
+- 公共 API Token 与单向转发配置保存在 `service_settings`，不得使用环境变量维护；Token/Secret 轮换后立即替换进程内快照，完整值只允许从受保护管理接口返回。
+- `POST /admin/logout` 必须清除授权文件、`chat_messages`、`inbound_events`、`outbound_messages`、`recipients`、`bridge_state` 和进程内页面队列，再启动新的扫码流程并 `303` 返回 `/admin`；不得清除 `service_settings`。
 - `WBB_WEB_PASSWORD` 未配置时管理端必须显式关闭，不能回退为无认证模式。
 - HTTP 发送目标固定为 `owner`，请求体不得接收 `recipient`、`user_id` 或 alias。
 - 只有与当前授权凭据 `user_id` 完全一致的入站发送者可以建立或刷新 owner；授权会话改变时必须清空上一会话的 owner。
@@ -116,7 +131,7 @@ UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 
 修改应在相应层补测试：
 
-- 配置：默认值、`WBB_` 覆盖、非法/空 secret。
+- 配置：进程级 `WBB_` 默认值与覆盖；公共 Token 自动生成、持久化、轮换和恒定时间校验；转发默认关闭、目标校验、动态生效和 Secret 轮换。
 - 认证：缺失、错误、正确 Bearer 与 Basic；确保恒定时间路径、两套凭据隔离和管理端禁用状态可覆盖。
 - 发送：owner 未绑定、缺失上下文、成功返回微信 `msg_id`、输入状态返回空 `msg_id`、上游失败。
 - 独立提交：相同正文的顺序或并发请求都必须创建不同消息。
@@ -127,7 +142,7 @@ UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 - 页面交互：键入启动/续租/超时取消、微信原生引用快照、点击已匹配引用定位并闪高两次、入站图片预览和文件下载；不得重新引入右键引用或出站引用预览。
 - Sink：`ChatHistorySink` 的落库与广播、慢订阅者队列行为。
 - iLink 客户端：必需请求头、`ret/errcode` 映射、`sendmessage.message_id` 解析、长轮询超时、cursor 恢复、二维码/配对码/IDC 跳转、授权文件格式、AES 三种 key 编码、CDN 上限、重启去重和账号切换后 context 作废。
-- Webhook：签名、超时、重试且不泄漏上下文。
+- 单向转发：关闭时不发送、原始 Body HMAC 签名、动态目标、超时、有界重试且不泄漏上下文。
 - 生命周期：启动、SIGTERM/关闭、轮询任务失败。
 - 账号生命周期：无凭据时等待页面、登录启动、二维码保护、配对数字、退出表单认证、凭据删除、队列排空、全表清理、并发发送互斥和页面 `account_reset`。
 - API/Web：外部 OpenAPI 只有一个 POST；管理页面、静态资源、CSP、状态码和响应模型。
@@ -171,6 +186,7 @@ CLI 帮助中只能出现常驻 `serve`，扫码登录统一由管理页面处�
 | 页面模板、静态资源或认证 | `README.md`、`docs/api.md`、浏览器验收 |
 | 登录、退出或本地清理语义 | `README.md`、`docs/api.md`、`docs/architecture.md`、生命周期测试 |
 | 架构边界 | `AGENT.md`、`docs/architecture.md` |
+| Windows EXE、冻结路径或打包资源 | `README.md`、`docs/windows-exe.md`、`docs/architecture.md`、发布烟测 |
 
 ## 完成定义
 
@@ -182,3 +198,5 @@ CLI 帮助中只能出现常驻 `serve`，扫码登录统一由管理页面处�
 4. 确认没有真实密钥、凭据、数据库或个人消息进入 diff。
 5. 确认 README、外部接口、管理接口和架构文档与实际行为一致。
 6. 在交付说明中列出已执行验证和任何已知限制。
+7. 修改 Windows 打包后必须实际生成 EXE，并验证无参数启动、外部数据目录、OpenAPI、管理页面
+   和静态资源；只运行源码测试不能声称发布通过。

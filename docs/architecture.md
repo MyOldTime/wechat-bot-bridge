@@ -17,12 +17,12 @@
 ```text
 src/wechat_bot_bridge/
 ├── api/                        外部 POST、Bearer、健康检查、HTTP schema
-├── application/                账号生命周期、发送编排、载荷校验、输入租约
-├── bootstrap/                  FastAPI/CLI 装配与生命周期
-├── core/                       WBB_* 配置
+├── application/                账号生命周期、发送编排、服务配置、载荷校验、输入租约
+├── bootstrap/                  FastAPI/CLI 装配、单实例锁与生命周期
+├── core/                       WBB_* 配置、源码/冻结程序路径策略
 ├── domain/                     模型、错误、端口
 ├── infrastructure/
-│   ├── inbound/                Dispatcher、ChatHistorySink、WebhookSink
+│   ├── inbound/                Dispatcher、ChatHistorySink、OutboundForwardingSink
 │   ├── persistence/            SQLite 事务、schema/迁移、行映射、历史游标
 │   ├── realtime/               进程内会话广播
 │   └── wechat/
@@ -34,7 +34,7 @@ src/wechat_bot_bridge/
 │       └── ilink/              内置协议客户端、授权、HTTP、消息和 CDN
 └── web/
     ├── router.py               管理路由装配
-    ├── routes/                 页面、账号、消息、WebSocket
+    ├── routes/                 页面、账号、消息、服务配置、WebSocket
     ├── schemas.py
     ├── security.py
     ├── templates/              Jinja2 服务端页面
@@ -72,6 +72,7 @@ flowchart LR
     WEB --> APP
     WEB --> ACCOUNT["AccountLifecycleService"]
     WEB --> LEASE["TypingLeaseService"]
+    WEB --> CONFIG["Token / Forwarding 配置服务"]
     LEASE --> APP
     APP --> STORE["SQLiteStore"]
     APP --> GW["WeChatGateway"]
@@ -86,7 +87,9 @@ flowchart LR
     CHAT --> STORE
     CHAT --> HUB
     DISP --> LOG["LoggingSink"]
-    DISP -.-> HOOK["可选 HMAC WebhookSink"]
+    DISP -.-> FORWARD["动态 HMAC OutboundForwardingSink"]
+    CONFIG --> STORE
+    CONFIG --> FORWARD
     STORE --> DB[("wechat-bridge.db")]
     CREDS[("credentials.json")] --> GW
 ```
@@ -206,13 +209,13 @@ sequenceDiagram
 7. 把仅供进程内聊天 Sink 使用的媒体附加到事件，再放入 `InboundDispatcher`；
 8. 整批处理成功后持久化新的 `get_updates_buf`。
 
-媒体字段在 Pydantic 模型中显式排除序列化，因此 `inbound_events.payload_json`、LoggingSink 和 Webhook 信封都不会包含媒体字节。解析器不生成 `[image]`、`[voice]` 等占位符，也不把图片 URL 拼入正文；iLink 媒体占位符会被过滤。下载失败、超时或超过上限时仍转发原始消息类型，不阻断消息历史。解析后的微信原生引用标题、类型和正文快照进入事件与 Webhook。
+媒体字段在 Pydantic 模型中显式排除序列化，因此 `inbound_events.payload_json`、LoggingSink 和单向转发信封都不会包含媒体字节。解析器不生成 `[image]`、`[voice]` 等占位符，也不把图片 URL 拼入正文；iLink 媒体占位符会被过滤。下载失败、超时或超过上限时仍转发原始消息类型，不阻断消息历史。解析后的微信原生引用标题、类型和正文快照进入规范化转发事件。
 
 Dispatcher 顺序调用：
 
 1. `ChatHistorySink`：写入 `chat_messages`，再向 `ConversationHub` 广播；
 2. `LoggingSink`：只记录事件 ID 和类型等脱敏元数据；
-3. 可选 `WebhookSink`：HMAC 签名、短超时、有限重试。
+3. `OutboundForwardingSink`：配置启用时读取当前快照，执行 HMAC 签名、短超时和有限重试。
 
 ```mermaid
 sequenceDiagram
@@ -236,7 +239,7 @@ sequenceDiagram
     H-->>B: WebSocket
 ```
 
-Webhook 使用有界进程内队列和有限重试，不提供重启续投；需要强可靠消费时，
+单向转发使用有界进程内队列和有限重试，不提供重启续投；需要强可靠消费时，
 下游必须先持久化事件并按 `event_id` 去重。
 
 ## 7. 管理 Web
@@ -252,8 +255,9 @@ Webhook 使用有界进程内队列和有限重试，不提供重启续投；需
 - 退出使用 Basic Auth 下的原生 URL 编码表单，并校验隐藏的短期页面令牌；成功清除后重定向回登录视图。
 - 输入框键入使用 `TypingLeaseService`；浏览器刷新防抖定时器，服务端租约到期后兜底取消微信输入状态。
 - 微信入站原生引用以只读快照展示；引用 item ID 精确匹配到已保存历史的顶层 message ID 或 item ID 时，引用框可点击定位原文并让目标气泡闪高两次。页面不提供右键引用或 Bot 出站引用。
+- 左侧服务配置菜单通过 `configuration.py` 管理自动生成的公共 API Token 和单向转发参数；读取 Secret 的响应使用 `no-store`，写操作复用现有短期页面令牌，登录后不重复询问密码。
 
-Basic 密码与外部 Bearer Key 不得复用。没有 `WBB_WEB_PASSWORD` 时整个管理端关闭。HTML 使用 `no-store`、严格 CSP 和禁止 framing；媒体启用 `nosniff` 与沙箱 CSP。
+Basic 密码与外部 Bearer Token 不得复用。没有 `WBB_WEB_PASSWORD` 时整个管理端关闭。HTML 使用 `no-store`、严格 CSP 和禁止 framing；媒体启用 `nosniff` 与沙箱 CSP。
 
 页面先建立 WebSocket，再在网关进入 `listening` 后加载 SQLite 历史并按 ID upsert，可覆盖“订阅与初次加载之间”的竞态。断线后自动重连；进程总线对慢订阅者丢弃最旧事件，因此历史接口始终是恢复依据。收到 `account_reset` 后页面立即清空内存消息、附件、原生引用快照和游标，并切换到扫码视图。
 
@@ -270,6 +274,19 @@ Docker 持久化布局：
     └── credentials.json
 ```
 
+Windows 单文件 EXE 的默认持久化布局：
+
+```text
+%LOCALAPPDATA%\wechat-bot-bridge\
+├── wechat-bridge.db
+├── wechat-bot-bridge.lock
+└── wechat\
+    └── credentials.json
+```
+
+`wechat-bot-bridge.lock` 是部署级非阻塞文件锁。锁只标识当前数据目录是否已被活动进程占用，
+不保存消息、凭据或用户标识；异常退出后操作系统自动释放锁，文件本身可以保留。
+
 主要表：
 
 - `bridge_state`：当前授权 fingerprint 和 cursor 等状态；
@@ -277,6 +294,7 @@ Docker 持久化布局：
 - `inbound_events`：入站事件去重；
 - `outbound_messages`：同步出站审计；
 - `chat_messages`：管理页面完整会话内容、媒体、方向、来源、状态，以及微信原生引用快照。
+- `service_settings`：公共 API Token 和单向转发配置；不属于微信账号业务数据。
 
 文字直接保存在 `chat_messages.text`。页面发送以及内置客户端下载成功的微信入站图片和文件保存在 BLOB，并通过 Basic 保护的媒体接口读取；图片以内容签名判断安全 MIME，未知内容使用 `application/octet-stream`，SVG 等未识别内容不会作为可内嵌图片提供。微信入站消息的官方 `MessageItem.msg_id` 和顶层 `WeixinMessage.message_id` 分别与账号 ID 一起哈希后保存在内部 `protocol_item_id`、`protocol_message_id`，不落原始值。Bot 出站主项固定使用本地消息 UUID 作为顶层 `client_id`，传输层解析线上 `sendmessage` 成功响应的整数 `message_id`；该值与微信引用中的 `MessageItem.msg_id` 相同，成功投递后按同样规则哈希写入对应出站记录。引用保存 `native_quote_title/type/text`、内部 `native_quote_protocol_item_id` 和精确目标；SQLite 用引用键匹配原消息的任一协议键并回填上游缺失的正文，不使用正文或时间猜测。
 
@@ -284,11 +302,12 @@ Docker 持久化布局：
 发送标记为 `delivery_interrupted`，不会自动重发。授权会话变化会让进行中的
 发送变为 `interaction_required` 并清除 owner 上下文。
 
-退出调用 `clear_all()`，在一个 `BEGIN IMMEDIATE` 事务中删除上述五张业务表。连接启用 `secure_delete`，提交后截断 WAL 并执行 `VACUUM`；数据库文件和目录保留，以便同一进程马上建立新授权。授权文件由网关在 SQLite 清理之前单独删除。
+退出调用 `clear_all()`，在一个 `BEGIN IMMEDIATE` 事务中删除五张账号业务表。`service_settings` 明确排除在清理集合之外，因此 Token 和转发配置保持有效。连接启用 `secure_delete`，提交后截断 WAL 并执行 `VACUUM`；数据库文件和目录保留，以便同一进程马上建立新授权。授权文件由网关在 SQLite 清理之前单独删除。
 
 ## 9. 生命周期与并发
 
 - 单进程、一个 Uvicorn worker、一个 iLink 长轮询所有者。
+- CLI 在打开 SQLite 前持有数据目录文件锁；第二个进程立即失败，不依赖端口冲突作为并发保护。
 - FastAPI lifespan 依次管理 SQLite、Dispatcher、Gateway task，并在关闭时停止和等待。
 - 无凭据时 Gateway task 常驻等待管理端登录事件；有有效凭据时直接启动监听。
 - 管理端输入租约任务也属于 lifespan；关闭前尽力取消仍处于活动状态的微信输入提示。
@@ -302,17 +321,17 @@ Docker 持久化布局：
 
 信任边界：
 
-1. 外部任务 -> `/api/v1/messages`：Bearer API Key；
+1. 外部任务 -> `/api/v1/messages`：管理页面生成的 Bearer Token；
 2. 管理浏览器 -> `/admin`：独立 Basic Auth；
 3. 已认证页面 -> 写操作、退出表单/WebSocket：短期 HMAC 页面令牌；
 4. 服务 -> iLink：宿主机映射的明文授权文件；
-5. 服务 -> 入站 Webhook：独立 HMAC secret。
+5. 服务 -> 单向转发目标：独立 HMAC Secret。
 
-API Key、Basic 密码、Webhook secret、iLink token、二维码原始 URL、配对数字和 `context_token` 不得进入 Git、日志或 JSON 响应。二维码只作为 Basic Auth 保护的 `no-store` SVG 图片返回。管理页有意展示聊天正文和媒体，因此只应通过 HTTPS/私网访问。健康接口只返回最小状态。
+公共 Token、Basic 密码、转发 HMAC Secret、iLink token、二维码原始 URL、配对数字和 `context_token` 不得进入 Git、日志或普通业务响应。完整公共 Token 和转发 Secret 仅能通过 Basic Auth 保护且 `no-store` 的专用管理响应读取。二维码只作为同样受保护的 `no-store` SVG 图片返回。管理页有意展示聊天正文和媒体，因此只应通过 HTTPS/私网访问。健康接口只返回最小状态。
 
 CLI 通过 `core/logging.py` 安装统一处理器。业务模块可以用 `extra` 提交上下文，
 但格式化器只输出审核过的消息 ID、事件 ID、类型、状态、错误码、HTTP 状态和
-重试字段；任意未列入白名单的字段都会被丢弃。Webhook 重试异常不会保留可能
+重试字段；任意未列入白名单的字段都会被丢弃。转发重试异常不会保留可能
 包含目标 URL 的异常链。
 
 ## 11. 内置 iLink 客户端与扩展
@@ -339,3 +358,23 @@ iLink 当前只提供 Bot 向微信发送或取消输入状态的 `sendtyping`�
 `ConversationPublisher`；新增出站类型必须同时更新领域模型、外部 schema、
 iLink wire 构造、SQLite、页面呈现、测试和文档。当前 iLink 渠道不暴露
 联系人列表；多用户渠道必须使用独立的目标解析模型。
+
+## 12. 冻结发布边界
+
+Windows 发布使用 PyInstaller one-file，入口为 `packaging/windows_entry.py`。无参数启动只在
+冻结入口映射为现有 `serve`，Python 模块和项目 CLI 不增加第二个业务子命令。spec 明确收集：
+
+- `wechat_bot_bridge/web/templates` 与 `web/static`；
+- 项目 dist-info，保证 `importlib.metadata.version()` 可用；
+- Uvicorn 动态选择的 HTTP、WebSocket、事件循环和 lifespan 子模块；
+- Python 解释器、Cryptography、SQLite 与其他锁定依赖。
+
+PyInstaller 解包目录只保存本次进程的只读代码和动态库。冻结程序通过 `sys.executable` 找到
+用户实际启动的 EXE，并只从该目录读取 `.env`；默认可写数据由平台数据目录解析器放到
+`%LOCALAPPDATA%\wechat-bot-bridge`。模板仍按包内 `__file__` 定位，因此源码、wheel、Docker
+和 one-file 共用同一套页面加载逻辑。发布包不得包含 `.env`、数据库、微信授权、聊天正文或
+真实 Token。
+
+Windows EXE 必须在 Windows 上构建。`scripts/build-windows.ps1` 使用独立 uv 环境执行全部质量
+门禁和 PyInstaller；`scripts/test-windows-release.ps1` 以临时数据目录启动真实单文件 EXE，
+验证默认 `serve`、外部 OpenAPI、Basic 管理页面、静态资源、SQLite 路径与单实例锁。

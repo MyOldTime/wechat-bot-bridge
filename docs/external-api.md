@@ -9,7 +9,7 @@
 | --- | --- |
 | 方法 | `POST` |
 | 路径 | `/api/v1/messages` |
-| 认证 | `Authorization: Bearer <WBB_API_KEY>` |
+| 认证 | `Authorization: Bearer <从 /admin 复制的公共 API Token>` |
 | 请求格式 | `application/json` |
 | 成功状态 | `200 OK` |
 | 发送模式 | 同步 |
@@ -26,7 +26,7 @@
 2. 管理员已访问 `/admin` 并完成微信扫码授权；
 3. 完成扫码的微信账号已主动向 Bot 发送至少一条私聊消息；
 4. `GET /health/ready` 返回 `200 {"status":"ready"}`；
-5. 调用方已取得服务端配置的 `WBB_API_KEY`。
+5. 调用方已从 Bridge `/admin` 左侧“公共 API Token”页面复制当前 Token。
 
 扫码只完成账号授权。第 3 步用于建立主动发送所需的唯一 owner 会话上下文，
 因此不能省略。接口不接受收件人 ID、联系人名称或收件人列表。
@@ -35,18 +35,18 @@
 
 ```text
 WBB_BRIDGE_URL=http://127.0.0.1:8000
-WBB_API_KEY=<与服务端相同的高熵密钥>
+BRIDGE_API_TOKEN=<从 Bridge 管理页面复制的 Token>
 ```
 
 跨主机调用必须使用 HTTPS 反向代理或受控私网，不要通过明文公网 HTTP 传输
-Bearer Key、消息正文或媒体内容。
+Bearer Token、消息正文或媒体内容。
 
 ## 3. 认证
 
 每次请求必须携带：
 
 ```http
-Authorization: Bearer <WBB_API_KEY>
+Authorization: Bearer <BRIDGE_API_TOKEN>
 Content-Type: application/json
 ```
 
@@ -66,8 +66,8 @@ WWW-Authenticate: Bearer
 }
 ```
 
-API Key 不应放入 URL、请求体、代码仓库、构建日志或异常消息。服务端 API Key
-至少 16 个字符，并且应与管理页面密码、Webhook 密钥分开生成。
+Token 不应放入 URL、请求体、代码仓库、构建日志或异常消息。Token 由 Bridge
+首次启动自动生成；管理员可以在页面复制或轮换，轮换后旧值立即失效。
 
 ## 4. 请求模型
 
@@ -156,7 +156,7 @@ API Key 不应放入 URL、请求体、代码仓库、构建日志或异常消�
 ```bash
 curl --fail-with-body \
   -X POST "${WBB_BRIDGE_URL}/api/v1/messages" \
-  -H "Authorization: Bearer ${WBB_API_KEY}" \
+  -H "Authorization: Bearer ${BRIDGE_API_TOKEN}" \
   -H "Content-Type: application/json" \
   -d '{"type":"text","text":"自动化任务已完成"}'
 ```
@@ -165,7 +165,7 @@ curl --fail-with-body \
 
 ```powershell
 $headers = @{
-    Authorization = "Bearer $env:WBB_API_KEY"
+    Authorization = "Bearer $env:BRIDGE_API_TOKEN"
 }
 $body = @{
     type = "text"
@@ -191,13 +191,13 @@ from typing import Any
 import httpx
 
 BRIDGE_URL = os.environ["WBB_BRIDGE_URL"].rstrip("/")
-API_KEY = os.environ["WBB_API_KEY"]
+API_TOKEN = os.environ["BRIDGE_API_TOKEN"]
 
 
 def send_wechat(payload: dict[str, Any]) -> dict[str, Any]:
     response = httpx.post(
         f"{BRIDGE_URL}/api/v1/messages",
-        headers={"Authorization": f"Bearer {API_KEY}"},
+        headers={"Authorization": f"Bearer {API_TOKEN}"},
         json=payload,
         timeout=90.0,
     )
@@ -301,7 +301,7 @@ else:
 
 | HTTP | `detail.code` | 含义 | 建议处理 |
 | --- | --- | --- | --- |
-| 401 | `unauthorized` | API Key 缺失或错误 | 修正认证，不重试 |
+| 401 | `unauthorized` | Token 缺失、错误或已轮换 | 获取当前 Token，不重试原凭据 |
 | 409 | `owner_not_bound` | owner 尚未建立 | 让扫码账号先向 Bot 私聊 |
 | 409 | `interaction_required` | 会话上下文缺失或需要互动 | 让 owner 再向 Bot 发消息 |
 | 422 | `invalid_message` | 空白、超限或部署级校验失败 | 修正请求，不重试 |
@@ -378,13 +378,13 @@ else:
 - iLink 主动发送可能受互动窗口和限频约束，`ret=-2` 不能单独确定具体原因。
 
 需要读取完整聊天、媒体或网关状态时使用受独立 Basic Auth 保护的 `/admin`。
-需要接收微信入站消息时配置 HMAC Webhook，契约见
-[HTTP 接口：入站 Webhook](api.md#7-入站-webhook)。
+需要接收微信入站消息时在 `/admin` 配置单向消息转发，契约见
+[HTTP 接口：单向消息转发](api.md#7-单向消息转发)。
 
 ## 10. 上线检查清单
 
-- [ ] `WBB_API_KEY` 使用高熵随机值且未写入仓库；
-- [ ] API Key 与管理密码、Webhook 密钥互不相同；
+- [ ] 已从 `/admin` 复制当前公共 API Token，且未写入仓库；
+- [ ] Token 与管理密码、转发 HMAC Secret 互不相同；
 - [ ] 跨主机流量经过 HTTPS 或受控私网；
 - [ ] `/health/ready` 返回 200；
 - [ ] owner 已主动向 Bot 发消息并完成绑定；

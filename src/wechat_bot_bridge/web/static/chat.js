@@ -14,6 +14,22 @@
     conversationPreview: document.querySelector("#conversation-preview"),
     conversationTime: document.querySelector("#conversation-time"),
     emptyState: document.querySelector("#empty-state"),
+    closeSettings: document.querySelector("#close-settings"),
+    copyForwardingSecret: document.querySelector("#copy-forwarding-secret"),
+    copyPublicApiToken: document.querySelector("#copy-public-api-token"),
+    forwardingAttempts: document.querySelector("#forwarding-attempts"),
+    forwardingEnabled: document.querySelector("#forwarding-enabled"),
+    forwardingForm: document.querySelector("#forwarding-form"),
+    forwardingHost: document.querySelector("#forwarding-host"),
+    forwardingPath: document.querySelector("#forwarding-path"),
+    forwardingPort: document.querySelector("#forwarding-port"),
+    forwardingScheme: document.querySelector("#forwarding-scheme"),
+    forwardingSecret: document.querySelector("#forwarding-secret"),
+    forwardingSettings: document.querySelector("#forwarding-settings"),
+    forwardingStatusBadge: document.querySelector("#forwarding-status-badge"),
+    forwardingTargetPreview: document.querySelector("#forwarding-target-preview"),
+    forwardingTimeout: document.querySelector("#forwarding-timeout"),
+    forwardingUpdated: document.querySelector("#forwarding-updated"),
     gatewayBadge: document.querySelector("#gateway-badge"),
     loginDescription: document.querySelector("#login-description"),
     loginPanel: document.querySelector("#login-panel"),
@@ -26,12 +42,23 @@
     messageInput: document.querySelector("#message-input"),
     messageList: document.querySelector("#message-list"),
     messageScroll: document.querySelector("#message-scroll"),
+    openForwardingSettings: document.querySelector("#open-forwarding-settings"),
+    openTokenSettings: document.querySelector("#open-token-settings"),
+    publicApiToken: document.querySelector("#public-api-token"),
+    publicApiTokenUpdated: document.querySelector("#public-api-token-updated"),
     refreshButton: document.querySelector("#refresh-button"),
     removeAttachment: document.querySelector("#remove-attachment"),
+    rotateForwardingSecret: document.querySelector("#rotate-forwarding-secret"),
+    rotatePublicApiToken: document.querySelector("#rotate-public-api-token"),
+    saveForwarding: document.querySelector("#save-forwarding"),
     sendButton: document.querySelector("#send-button"),
     startLoginButton: document.querySelector("#start-login-button"),
+    settingsPanel: document.querySelector("#settings-panel"),
     toastRegion: document.querySelector("#toast-region"),
     typingIndicator: document.querySelector("#typing-indicator"),
+    toggleForwardingSecret: document.querySelector("#toggle-forwarding-secret"),
+    togglePublicApiToken: document.querySelector("#toggle-public-api-token"),
+    tokenSettings: document.querySelector("#token-settings"),
     verificationCode: document.querySelector("#verification-code"),
     verificationForm: document.querySelector("#verification-form"),
     qrFrame: document.querySelector("#qr-frame"),
@@ -182,6 +209,170 @@
       throw new Error(message);
     }
     return response.json();
+  }
+
+  function formatUpdatedAt(value) {
+    if (!value) return "";
+    return `最近更新：${new Intl.DateTimeFormat("zh-CN", {
+      dateStyle: "medium",
+      timeStyle: "medium",
+      hour12: false,
+    }).format(new Date(value))}`;
+  }
+
+  async function copySecret(value, label) {
+    if (!value) {
+      showToast(`${label}尚未加载`, "error");
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch {
+      try {
+        const temporary = document.createElement("textarea");
+        temporary.value = value;
+        temporary.setAttribute("readonly", "");
+        temporary.style.position = "fixed";
+        temporary.style.opacity = "0";
+        document.body.append(temporary);
+        temporary.select();
+        const copied = document.execCommand("copy");
+        temporary.remove();
+        if (!copied) throw new Error("copy rejected");
+      } catch {
+        showToast("浏览器未允许复制，请显示后手动复制", "error");
+        return;
+      }
+    }
+    showToast(`${label}已复制`);
+  }
+
+  function toggleSecretVisibility(input, button) {
+    const revealing = input.type === "password";
+    input.type = revealing ? "text" : "password";
+    button.textContent = revealing ? "隐藏" : "显示";
+  }
+
+  async function loadPublicApiToken() {
+    elements.publicApiToken.value = "";
+    elements.publicApiTokenUpdated.textContent = "正在读取…";
+    const token = await requestJson("/admin/api/public-api-token");
+    elements.publicApiToken.value = token.token;
+    elements.publicApiTokenUpdated.textContent = formatUpdatedAt(token.updated_at);
+  }
+
+  function updateForwardingPreview() {
+    const scheme = elements.forwardingScheme.value || "http";
+    const rawHost = elements.forwardingHost.value.trim();
+    const host = rawHost.includes(":") && !rawHost.startsWith("[") ? `[${rawHost}]` : rawHost;
+    const port = elements.forwardingPort.value;
+    const path = elements.forwardingPath.value || "/";
+    elements.forwardingTargetPreview.textContent = `${scheme}://${host}:${port}${path}`;
+  }
+
+  function renderForwardingConfig(config) {
+    elements.forwardingEnabled.checked = config.enabled;
+    elements.forwardingScheme.value = config.scheme;
+    elements.forwardingHost.value = config.host;
+    elements.forwardingPort.value = String(config.port);
+    elements.forwardingPath.value = config.path;
+    elements.forwardingSecret.value = config.secret;
+    elements.forwardingTimeout.value = String(config.timeout_seconds);
+    elements.forwardingAttempts.value = String(config.max_attempts);
+    elements.forwardingUpdated.textContent = formatUpdatedAt(config.updated_at);
+    elements.forwardingStatusBadge.textContent = config.enabled ? "已启用" : "已关闭";
+    elements.forwardingStatusBadge.classList.toggle("muted", !config.enabled);
+    updateForwardingPreview();
+  }
+
+  async function loadForwardingConfig() {
+    elements.forwardingUpdated.textContent = "正在读取…";
+    renderForwardingConfig(await requestJson("/admin/api/outbound-forwarding"));
+  }
+
+  async function openSettings(view) {
+    elements.settingsPanel.hidden = false;
+    elements.tokenSettings.hidden = view !== "token";
+    elements.forwardingSettings.hidden = view !== "forwarding";
+    try {
+      if (view === "token") await loadPublicApiToken();
+      else await loadForwardingConfig();
+    } catch (error) {
+      showToast(error.message, "error");
+    }
+  }
+
+  function closeSettings() {
+    elements.settingsPanel.hidden = true;
+    elements.publicApiToken.type = "password";
+    elements.forwardingSecret.type = "password";
+    elements.togglePublicApiToken.textContent = "显示";
+    elements.toggleForwardingSecret.textContent = "显示";
+  }
+
+  async function rotatePublicApiToken() {
+    if (!window.confirm("轮换后旧 Token 会立即失效。确定继续吗？")) return;
+    elements.rotatePublicApiToken.disabled = true;
+    try {
+      const token = await requestJson("/admin/api/public-api-token/rotate", {
+        method: "POST",
+        headers: { "X-Admin-Token": adminToken },
+      });
+      elements.publicApiToken.value = token.token;
+      elements.publicApiTokenUpdated.textContent = formatUpdatedAt(token.updated_at);
+      showToast("公共 API Token 已轮换");
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      elements.rotatePublicApiToken.disabled = false;
+    }
+  }
+
+  async function rotateForwardingSecret() {
+    if (!window.confirm("轮换后目标服务必须同步更新 HMAC Secret。确定继续吗？")) return;
+    elements.rotateForwardingSecret.disabled = true;
+    try {
+      const config = await requestJson("/admin/api/outbound-forwarding/rotate-secret", {
+        method: "POST",
+        headers: { "X-Admin-Token": adminToken },
+      });
+      renderForwardingConfig(config);
+      showToast("HMAC Secret 已轮换");
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      elements.rotateForwardingSecret.disabled = false;
+    }
+  }
+
+  async function saveForwardingConfig(event) {
+    event.preventDefault();
+    elements.saveForwarding.disabled = true;
+    try {
+      const config = await requestJson("/admin/api/outbound-forwarding", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Admin-Token": adminToken,
+        },
+        body: JSON.stringify({
+          enabled: elements.forwardingEnabled.checked,
+          scheme: elements.forwardingScheme.value,
+          host: elements.forwardingHost.value.trim(),
+          port: Number(elements.forwardingPort.value),
+          path: elements.forwardingPath.value,
+          secret: elements.forwardingSecret.value,
+          timeout_seconds: Number(elements.forwardingTimeout.value),
+          max_attempts: Number(elements.forwardingAttempts.value),
+        }),
+      });
+      renderForwardingConfig(config);
+      showToast("消息转发配置已保存");
+    } catch (error) {
+      showToast(error.message, "error");
+    } finally {
+      elements.saveForwarding.disabled = false;
+    }
   }
 
   function sortedMessages() {
@@ -786,6 +977,36 @@
   }
 
   // 页面事件绑定与启动。
+  elements.openTokenSettings.addEventListener("click", () => openSettings("token"));
+  elements.openForwardingSettings.addEventListener("click", () => openSettings("forwarding"));
+  elements.closeSettings.addEventListener("click", closeSettings);
+  elements.togglePublicApiToken.addEventListener("click", () =>
+    toggleSecretVisibility(elements.publicApiToken, elements.togglePublicApiToken),
+  );
+  elements.toggleForwardingSecret.addEventListener("click", () =>
+    toggleSecretVisibility(elements.forwardingSecret, elements.toggleForwardingSecret),
+  );
+  elements.copyPublicApiToken.addEventListener("click", () =>
+    copySecret(elements.publicApiToken.value, "公共 API Token"),
+  );
+  elements.copyForwardingSecret.addEventListener("click", () =>
+    copySecret(elements.forwardingSecret.value, "HMAC Secret"),
+  );
+  elements.rotatePublicApiToken.addEventListener("click", rotatePublicApiToken);
+  elements.rotateForwardingSecret.addEventListener("click", rotateForwardingSecret);
+  elements.forwardingForm.addEventListener("submit", saveForwardingConfig);
+  for (const input of [
+    elements.forwardingScheme,
+    elements.forwardingHost,
+    elements.forwardingPort,
+    elements.forwardingPath,
+  ]) {
+    input.addEventListener("input", updateForwardingPreview);
+    input.addEventListener("change", updateForwardingPreview);
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !elements.settingsPanel.hidden) closeSettings();
+  });
   elements.composer.addEventListener("submit", sendMessage);
   elements.messageInput.addEventListener("input", () => {
     updateComposer();

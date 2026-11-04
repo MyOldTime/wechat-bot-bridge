@@ -8,13 +8,13 @@ from ..application.messaging import NotificationService
 from ..domain.models import MessageOrigin
 from .errors import send_with_http_errors
 from .schemas import SendMessageRequest, SendMessageResponse, to_domain_payload
-from .security import require_api_key
+from .security import require_public_api_token
 
 
 def build_external_router() -> APIRouter:
     router = APIRouter(
         prefix="/api/v1",
-        dependencies=[Security(require_api_key)],
+        dependencies=[Security(require_public_api_token)],
     )
 
     @router.post(

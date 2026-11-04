@@ -22,6 +22,12 @@ _BASE_SCHEMA_SQL: Final[str] = """
         value TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS service_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS recipients (
         alias TEXT PRIMARY KEY,
         user_id TEXT NOT NULL,

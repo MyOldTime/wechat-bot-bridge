@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from urllib.parse import quote
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ..domain.models import (
     ConversationDirection,
@@ -14,12 +14,86 @@ from ..domain.models import (
     ConversationMessageType,
     ConversationQuote,
     ConversationStatus,
+    ForwardingScheme,
     MessageOrigin,
+    OutboundForwardingConfig,
+    PublicApiTokenSnapshot,
 )
 
 
 class AdminVerificationCodeRequest(BaseModel):
     code: str = Field(min_length=1, max_length=32, pattern=r"^\d+$")
+
+
+class PublicApiTokenResponse(BaseModel):
+    token: str
+    masked_token: str
+    updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, snapshot: PublicApiTokenSnapshot) -> PublicApiTokenResponse:
+        return cls(
+            token=snapshot.token,
+            masked_token=f"{snapshot.token[:12]}…{snapshot.token[-4:]}",
+            updated_at=snapshot.updated_at,
+        )
+
+
+class OutboundForwardingUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    scheme: ForwardingScheme
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(ge=1, le=65535)
+    path: str = Field(min_length=1, max_length=512)
+    secret: str | None = Field(default=None, min_length=32, max_length=512)
+    timeout_seconds: float = Field(gt=0, le=60)
+    max_attempts: int = Field(ge=1, le=10)
+
+    @model_validator(mode="after")
+    def validate_target(self) -> OutboundForwardingUpdateRequest:
+        # 复用领域模型的主机、路径和组合校验；占位 Secret 不会被保存。
+        OutboundForwardingConfig(
+            enabled=self.enabled,
+            scheme=self.scheme,
+            host=self.host,
+            port=self.port,
+            path=self.path,
+            secret=self.secret or "x" * 32,
+            timeout_seconds=self.timeout_seconds,
+            max_attempts=self.max_attempts,
+            updated_at=datetime.now(UTC),
+        )
+        return self
+
+
+class OutboundForwardingResponse(BaseModel):
+    enabled: bool
+    scheme: ForwardingScheme
+    host: str
+    port: int
+    path: str
+    target_url: str
+    secret: str
+    timeout_seconds: float
+    max_attempts: int
+    updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, config: OutboundForwardingConfig) -> OutboundForwardingResponse:
+        return cls(
+            enabled=config.enabled,
+            scheme=config.scheme,
+            host=config.host,
+            port=config.port,
+            path=config.path,
+            target_url=config.url,
+            secret=config.secret,
+            timeout_seconds=config.timeout_seconds,
+            max_attempts=config.max_attempts,
+            updated_at=config.updated_at,
+        )
 
 
 class InboundQuoteResponse(BaseModel):

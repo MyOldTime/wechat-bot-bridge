@@ -12,6 +12,7 @@ from .models import (
     GatewayStatus,
     InboundEvent,
     MessageOrigin,
+    OutboundForwardingConfig,
     OutboundMessage,
     OutboundMessageType,
     OutboundPayload,
@@ -148,7 +149,24 @@ class WeChatStateStore(Protocol):
     async def set_state(self, key: str, value: str) -> None: ...
 
 
-class BridgeStore(OutboundMessageStore, WeChatStateStore, Protocol):
+class ServiceConfigurationStore(Protocol):
+    """不随微信账号退出而清除的服务级配置存储。"""
+
+    async def get_service_setting(self, key: str) -> str | None: ...
+
+    async def set_service_setting(self, key: str, value: str) -> None: ...
+
+
+class OutboundForwardingConfigProvider(Protocol):
+    async def current(self) -> OutboundForwardingConfig: ...
+
+
+class BridgeStore(
+    OutboundMessageStore,
+    WeChatStateStore,
+    ServiceConfigurationStore,
+    Protocol,
+):
     @property
     def is_open(self) -> bool: ...
 

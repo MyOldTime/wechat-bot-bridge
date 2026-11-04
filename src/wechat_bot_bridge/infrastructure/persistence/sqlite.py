@@ -130,6 +130,35 @@ class SQLiteStore:
             )
             await connection.commit()
 
+    async def get_service_setting(self, key: str) -> str | None:
+        """读取不受微信账号生命周期影响的服务配置。"""
+
+        connection = self._require_connection()
+        async with self._lock:
+            cursor = await connection.execute(
+                "SELECT value FROM service_settings WHERE key = ?",
+                (key,),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+        return str(row["value"]) if row else None
+
+    async def set_service_setting(self, key: str, value: str) -> None:
+        """原子替换服务配置；值可能含 Secret，调用方不得记录正文。"""
+
+        connection = self._require_connection()
+        async with self._lock:
+            await connection.execute(
+                """
+                INSERT INTO service_settings(key, value, updated_at) VALUES(?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, _dump_time(utc_now())),
+            )
+            await connection.commit()
+
     async def activate_session(self, fingerprint: str) -> bool:
         """激活当前授权会话，并作废旧 token 对应的状态。"""
 

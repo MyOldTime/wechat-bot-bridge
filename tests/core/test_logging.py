@@ -17,7 +17,7 @@ def test_safe_context_formatter_outputs_allowlisted_fields_only() -> None:
         args=(),
         exc_info=None,
     )
-    record.event_id = "event-1"
+    record.event_id_hash = "d3f98ac512aa"
     record.message_type = "text"
     # 非白名单字段模拟高敏上下文，即使调用方误传也不能进入最终文本。
     record.context_token = "must-not-leak"
@@ -26,7 +26,7 @@ def test_safe_context_formatter_outputs_allowlisted_fields_only() -> None:
     rendered = SafeContextFormatter("%(levelname)s %(message)s").format(record)
 
     assert rendered.startswith("INFO 测试日志 context=")
-    assert '"event_id":"event-1"' in rendered
+    assert '"event_id_hash":"d3f98ac512aa"' in rendered
     assert '"message_type":"text"' in rendered
     assert "must-not-leak" not in rendered
     assert "private-message" not in rendered

@@ -13,7 +13,7 @@ from contextlib import suppress
 import httpx
 
 from ...domain.models import InboundEvent
-from ...domain.ports import InboundSink
+from ...domain.ports import InboundSink, OutboundForwardingConfigProvider
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +25,7 @@ class LoggingSink:
         logger.info(
             "微信入站事件已完成统一分发",
             extra={
-                "event_id": event.event_id,
+                "event_id_hash": hashlib.sha256(event.event_id.encode("utf-8")).hexdigest()[:12],
                 "message_type": event.message.type,
             },
         )
@@ -34,69 +34,81 @@ class LoggingSink:
         return None
 
 
-class WebhookSink:
-    """使用 HMAC 签名和有上限重试投递脱敏事件。"""
+class OutboundForwardingSink:
+    """按管理页面的当前配置单向投递规范化入站事件。"""
 
     def __init__(
         self,
         *,
-        url: str,
-        secret: str,
-        timeout_seconds: float,
-        max_attempts: int,
+        config_provider: OutboundForwardingConfigProvider,
+        client: httpx.AsyncClient | None = None,
     ) -> None:
-        self._url = url
-        self._secret = secret.encode("utf-8")
-        self._max_attempts = max_attempts
-        self._client = httpx.AsyncClient(timeout=timeout_seconds, follow_redirects=False)
+        self._config_provider = config_provider
+        self._client = client or httpx.AsyncClient(follow_redirects=False)
+        self._owns_client = client is None
 
     async def deliver(self, event: InboundEvent) -> None:
+        config = await self._config_provider.current()
+        if not config.enabled:
+            return
+
         payload = json.dumps(
             event.model_dump(mode="json"),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
         ).encode("utf-8")
-        timestamp = str(int(time.time()))
-        signature = hmac.new(
-            self._secret,
-            timestamp.encode("ascii") + b"." + payload,
-            hashlib.sha256,
-        ).hexdigest()
-        headers = {
-            "Content-Type": "application/json",
-            "X-WeChat-Bridge-Event": event.event_id,
-            "X-WeChat-Bridge-Timestamp": timestamp,
-            "X-WeChat-Bridge-Signature": f"sha256={signature}",
-        }
-
-        for attempt in range(1, self._max_attempts + 1):
+        event_log_id = hashlib.sha256(event.event_id.encode("utf-8")).hexdigest()[:12]
+        for attempt in range(1, config.max_attempts + 1):
+            attempt_started = time.monotonic()
+            timestamp = str(int(time.time()))
+            signature = hmac.new(
+                config.secret.encode("utf-8"),
+                timestamp.encode("ascii") + b"." + payload,
+                hashlib.sha256,
+            ).hexdigest()
+            headers = {
+                "Content-Type": "application/json",
+                "X-WeChat-Bridge-Event": event.event_id,
+                "X-WeChat-Bridge-Timestamp": timestamp,
+                "X-WeChat-Bridge-Signature": f"sha256={signature}",
+            }
             try:
-                response = await self._client.post(self._url, content=payload, headers=headers)
+                response = await self._client.post(
+                    config.url,
+                    content=payload,
+                    headers=headers,
+                    timeout=config.timeout_seconds,
+                )
                 response.raise_for_status()
                 return
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as exc:
+            except (httpx.RequestError, httpx.HTTPStatusError) as exc:
                 delay = min(2 ** (attempt - 1), 4)
                 http_status = (
                     exc.response.status_code if isinstance(exc, httpx.HTTPStatusError) else None
                 )
                 logger.warning(
-                    "入站 Webhook 投递失败",
+                    "单向消息转发失败",
                     extra={
-                        "event_id": event.event_id,
+                        "event_id_hash": event_log_id,
+                        "target_scheme": config.scheme.value,
+                        "target_host": config.host,
+                        "target_port": config.port,
                         "attempt": attempt,
-                        "max_attempts": self._max_attempts,
+                        "max_attempts": config.max_attempts,
                         "http_status": http_status,
-                        "retry_delay_seconds": (delay if attempt < self._max_attempts else None),
+                        "retry_delay_seconds": (delay if attempt < config.max_attempts else None),
+                        "elapsed_ms": round((time.monotonic() - attempt_started) * 1000),
                     },
                 )
-                if attempt < self._max_attempts:
+                if attempt < config.max_attempts:
                     await asyncio.sleep(delay)
-        # 失败原因已按安全字段记录；异常链可能包含 Webhook URL，因此不向上透传。
-        raise RuntimeError("Inbound webhook delivery exhausted its retry budget") from None
+        # 异常链可能含完整 URL，因此只向分发器返回稳定错误。
+        raise RuntimeError("Outbound forwarding exhausted its retry budget") from None
 
     async def close(self) -> None:
-        await self._client.aclose()
+        if self._owns_client:
+            await self._client.aclose()
 
 
 class InboundDispatcher:
@@ -162,7 +174,9 @@ class InboundDispatcher:
                         logger.exception(
                             "入站 Sink 投递失败",
                             extra={
-                                "event_id": event.event_id,
+                                "event_id_hash": hashlib.sha256(
+                                    event.event_id.encode("utf-8")
+                                ).hexdigest()[:12],
                                 "sink": type(sink).__name__,
                             },
                         )

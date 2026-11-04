@@ -5,6 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Security
 
 from .routes.account import build_account_router
+from .routes.configuration import build_configuration_router
 from .routes.messages import build_message_router
 from .routes.page import build_page_router
 from .routes.realtime import build_realtime_router
@@ -25,6 +26,7 @@ def build_web_router() -> APIRouter:
     )
     protected.include_router(build_account_router())
     protected.include_router(build_message_router())
+    protected.include_router(build_configuration_router())
     root.include_router(
         build_page_router(),
         prefix="/admin",

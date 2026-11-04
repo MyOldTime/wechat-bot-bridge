@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from ..core.config import Settings
 from ..core.logging import configure_logging
 from .app import create_app
+from .single_instance import InstanceAlreadyRunningError, single_instance
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -31,7 +32,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _load_settings(parser: argparse.ArgumentParser) -> Settings:
     try:
-        return Settings()  # type: ignore[call-arg]
+        return Settings()
     except ValidationError as exc:
         parser.error(f"invalid configuration: {exc}")
 
@@ -43,14 +44,18 @@ def main(argv: Sequence[str] | None = None) -> None:
     configure_logging(settings.log_level)
 
     if args.command == "serve":
-        uvicorn.run(
-            create_app(settings),
-            host=settings.host,
-            port=settings.port,
-            log_level=settings.log_level,
-            log_config=None,
-            workers=1,
-        )
+        try:
+            with single_instance(settings.data_dir):
+                uvicorn.run(
+                    create_app(settings),
+                    host=settings.host,
+                    port=settings.port,
+                    log_level=settings.log_level,
+                    log_config=None,
+                    workers=1,
+                )
+        except InstanceAlreadyRunningError as exc:
+            parser.exit(2, f"{exc}\n")
         return
 
     parser.error(f"unknown command: {args.command}")

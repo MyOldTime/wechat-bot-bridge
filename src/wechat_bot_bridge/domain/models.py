@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from ipaddress import ip_address
 from typing import Final, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 OWNER_ALIAS: Final[str] = "owner"
 
@@ -203,7 +205,7 @@ class InboundQuote(BaseModel):
 
 
 class InboundMedia(BaseModel):
-    """只供进程内 Sink 使用的媒体，不进入 Webhook 或去重信封。"""
+    """只供进程内 Sink 使用的媒体，不进入单向转发或去重信封。"""
 
     model_config = ConfigDict(frozen=True)
 
@@ -231,7 +233,7 @@ class InboundEvent(BaseModel):
         repr=False,
     )
     # 微信入站引用可能用顶层 message_id 指向原消息，而不是原消息项的 msg_id。
-    # 两个值均只保存账号隔离后的哈希，不进入 Webhook 或普通序列化结果。
+    # 两个值均只保存账号隔离后的哈希，不进入单向转发或普通序列化结果。
     protocol_message_id: str | None = Field(
         default=None,
         max_length=256,
@@ -239,6 +241,79 @@ class InboundEvent(BaseModel):
         repr=False,
     )
     media: InboundMedia | None = Field(default=None, exclude=True)
+
+
+class ForwardingScheme(StrEnum):
+    HTTP = "http"
+    HTTPS = "https"
+
+
+class PublicApiTokenSnapshot(BaseModel):
+    """管理页面可读取的当前公共 API Token 快照。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: Literal[1] = 1
+    token: str = Field(min_length=32, max_length=256, repr=False)
+    updated_at: datetime
+
+
+class OutboundForwardingConfig(BaseModel):
+    """Bridge 主动发送入站事件时使用的持久配置。"""
+
+    model_config = ConfigDict(frozen=True)
+
+    schema_version: Literal[1] = 1
+    enabled: bool = False
+    scheme: ForwardingScheme = ForwardingScheme.HTTP
+    host: str = Field(default="127.0.0.1", min_length=1, max_length=253)
+    port: int = Field(default=8765, ge=1, le=65535)
+    path: str = Field(
+        default="/v1/sources/wechat-bridge/events",
+        min_length=1,
+        max_length=512,
+    )
+    secret: str = Field(min_length=32, max_length=512, repr=False)
+    timeout_seconds: float = Field(default=8.0, gt=0, le=60)
+    max_attempts: int = Field(default=3, ge=1, le=10)
+    updated_at: datetime
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        normalized = value.strip()
+        if normalized.startswith("[") and normalized.endswith("]"):
+            normalized = normalized[1:-1]
+        if not normalized or any(character.isspace() for character in normalized):
+            raise ValueError("host must not be empty or contain whitespace")
+        if any(character in normalized for character in "/@?#"):
+            raise ValueError("host must not contain URL path or user information")
+        try:
+            return str(ip_address(normalized))
+        except ValueError:
+            hostname = normalized.lower()
+            if len(hostname) > 253 or not all(
+                re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                for label in hostname.split(".")
+            ):
+                raise ValueError("host must be a valid hostname or IP address") from None
+            return hostname
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        if not value.startswith("/"):
+            raise ValueError("path must start with /")
+        if any(character in value for character in "?#"):
+            raise ValueError("path must not contain a query or fragment")
+        if any(ord(character) < 0x20 or character.isspace() for character in value):
+            raise ValueError("path must not contain whitespace or control characters")
+        return value
+
+    @property
+    def url(self) -> str:
+        host = f"[{self.host}]" if ":" in self.host else self.host
+        return f"{self.scheme.value}://{host}:{self.port}{self.path}"
 
 
 class GatewayPhase(StrEnum):

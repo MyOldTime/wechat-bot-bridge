@@ -9,8 +9,8 @@
     <meta name="media-max-bytes" content="{{ media_max_bytes }}">
     <meta name="typing-timeout-seconds" content="{{ typing_timeout_seconds }}">
     <title>微信 Bot 对话 · wechat-bot-bridge</title>
-    <link rel="stylesheet" href="/admin/static/chat.css?v=7">
-    <script src="/admin/static/chat.js?v=7" defer></script>
+    <link rel="stylesheet" href="/admin/static/chat.css?v=8">
+    <script src="/admin/static/chat.js?v=8" defer></script>
   </head>
   <body>
     <main class="app-shell">
@@ -35,6 +35,24 @@
           </span>
           <span id="conversation-time" class="conversation-time"></span>
         </button>
+
+        <nav class="sidebar-menu" aria-label="服务配置">
+          <div class="sidebar-label">服务配置</div>
+          <button id="open-token-settings" class="sidebar-menu-button" type="button">
+            <span class="sidebar-menu-icon" aria-hidden="true">钥</span>
+            <span>
+              <strong>公共 API Token</strong>
+              <small>查看、复制与轮换</small>
+            </span>
+          </button>
+          <button id="open-forwarding-settings" class="sidebar-menu-button" type="button">
+            <span class="sidebar-menu-icon" aria-hidden="true">发</span>
+            <span>
+              <strong>消息转发</strong>
+              <small>配置单向 HTTP 发送</small>
+            </span>
+          </button>
+        </nav>
 
         <div class="sidebar-footer">
           <span class="avatar admin-avatar" aria-hidden="true">{{ web_username[:1] | upper }}</span>
@@ -99,6 +117,112 @@
               <input type="hidden" name="admin_token" value="{{ admin_token }}">
               <button type="submit">清除本地状态并重新登录</button>
             </form>
+          </div>
+        </section>
+
+        <section id="settings-panel" class="settings-panel" aria-labelledby="settings-title" hidden>
+          <div class="settings-card">
+            <header class="settings-header">
+              <div>
+                <p class="settings-kicker">SERVICE SETTINGS</p>
+                <h2 id="settings-title">服务配置</h2>
+              </div>
+              <button id="close-settings" class="settings-close" type="button" aria-label="关闭配置">×</button>
+            </header>
+
+            <section id="token-settings" class="settings-section" hidden>
+              <div class="settings-section-heading">
+                <div>
+                  <h3>公共 API Token</h3>
+                  <p>外部程序调用 <code>POST /api/v1/messages</code> 时使用该 Bearer Token。</p>
+                </div>
+                <span class="settings-badge">立即生效</span>
+              </div>
+              <label for="public-api-token">当前 Token</label>
+              <div class="secret-input-row">
+                <input id="public-api-token" type="password" readonly autocomplete="off" spellcheck="false">
+                <button id="toggle-public-api-token" type="button">显示</button>
+                <button id="copy-public-api-token" type="button">复制</button>
+              </div>
+              <p id="public-api-token-updated" class="settings-meta"></p>
+              <div class="settings-warning">
+                轮换后旧 Token 会立即失效，请同步更新所有调用方。
+              </div>
+              <div class="settings-actions">
+                <button id="rotate-public-api-token" class="danger-outline-button" type="button">轮换 Token</button>
+              </div>
+            </section>
+
+            <section id="forwarding-settings" class="settings-section" hidden>
+              <div class="settings-section-heading">
+                <div>
+                  <h3>单向消息转发</h3>
+                  <p>只把微信入站事件发送到目标服务，不接收任务结果。</p>
+                </div>
+                <span id="forwarding-status-badge" class="settings-badge muted">已关闭</span>
+              </div>
+
+              <form id="forwarding-form" class="settings-form">
+                <label class="switch-row" for="forwarding-enabled">
+                  <span>
+                    <strong>启用消息转发</strong>
+                    <small>保存后对下一条微信入站消息生效</small>
+                  </span>
+                  <input id="forwarding-enabled" type="checkbox">
+                </label>
+
+                <div class="settings-grid target-grid">
+                  <label>
+                    协议
+                    <select id="forwarding-scheme">
+                      <option value="http">HTTP</option>
+                      <option value="https">HTTPS</option>
+                    </select>
+                  </label>
+                  <label class="host-field">
+                    地址
+                    <input id="forwarding-host" type="text" maxlength="253" required spellcheck="false">
+                  </label>
+                  <label>
+                    端口
+                    <input id="forwarding-port" type="number" min="1" max="65535" required>
+                  </label>
+                </div>
+
+                <label>
+                  路径
+                  <input id="forwarding-path" type="text" maxlength="512" required spellcheck="false">
+                </label>
+
+                <label for="forwarding-secret">HMAC Secret</label>
+                <div class="secret-input-row">
+                  <input id="forwarding-secret" type="password" minlength="32" maxlength="512" required autocomplete="off" spellcheck="false">
+                  <button id="toggle-forwarding-secret" type="button">显示</button>
+                  <button id="copy-forwarding-secret" type="button">复制</button>
+                  <button id="rotate-forwarding-secret" type="button">轮换</button>
+                </div>
+
+                <div class="settings-grid">
+                  <label>
+                    请求超时（秒）
+                    <input id="forwarding-timeout" type="number" min="0.1" max="60" step="0.1" required>
+                  </label>
+                  <label>
+                    最大尝试次数
+                    <input id="forwarding-attempts" type="number" min="1" max="10" required>
+                  </label>
+                </div>
+
+                <div class="target-preview">
+                  <span>目标地址</span>
+                  <code id="forwarding-target-preview"></code>
+                </div>
+                <p id="forwarding-updated" class="settings-meta"></p>
+                <div class="settings-actions">
+                  <button id="save-forwarding" class="primary-settings-button" type="submit">保存配置</button>
+                </div>
+              </form>
+            </section>
           </div>
         </section>
 

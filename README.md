@@ -10,7 +10,7 @@
 - 外部系统只有一个业务接口：`POST /api/v1/messages`。
 - 支持文字、图片、普通文件、开始输入和取消输入；每次 POST 都是独立消息。
 - 外部文字、图片和文件发送成功时同时返回内部 `id` 与微信服务端 `msg_id`。
-- 外部 API 使用 Bearer API Key，管理页面使用另一组 HTTP Basic Auth。
+- 外部 API 使用管理页面自动生成的 Bearer Token，管理页面使用独立的 HTTP Basic Auth。
 - `/admin` 提供非前后端分离的服务端页面，可查看完整聊天内容并发送消息。
 - 微信扫码授权统一在受 Basic Auth 保护的 `/admin` 页面完成。
 - 管理页面可退出微信；退出会停止监听并清除授权文件、全部聊天/媒体、owner、游标、入站去重和出站审计，然后返回扫码界面。
@@ -19,12 +19,15 @@
 - 管理页面和外部接口都不提供出站引用；页面只读展示微信发来的原生引用。
 - 微信入站图片和文件会通过内置 iLink 客户端下载、解密后落入 SQLite，并在管理页面以内嵌预览或受保护下载链接展示。
 - 外部消息、页面消息和微信入站消息通过 WebSocket 及时更新到页面。
-- `ChatHistorySink` 复用统一入站分发机制，将微信消息保存到 SQLite；可选 HMAC Webhook 仍可并行转发。
+- `/admin` 左侧可以查看、复制和轮换公共 API Token，并配置单向 HTTP 消息转发。
+- `ChatHistorySink` 将微信消息保存到 SQLite；`OutboundForwardingSink` 可按页面配置使用 HMAC 并行转发规范化事件。
 - Docker Compose 保持单进程部署，并把数据库和微信授权文件映射到宿主机 `./data`。
+- Windows 可生成不依赖 Python/uv 的单文件 `wechat-bot-bridge.exe`；页面资源嵌入 EXE，数据库和微信授权始终保存在 EXE 外部。
 
 外部系统接入见 [外部消息接口对接指南](docs/external-api.md)，管理端与
-Webhook 契约见 [HTTP 接口](docs/api.md)，设计和边界见
+单向转发契约见 [HTTP 接口](docs/api.md)，设计和边界见
 [架构文档](docs/architecture.md)。
+Windows 原生部署见 [Windows EXE 部署](docs/windows-exe.md)。
 
 ## 项目结构
 
@@ -40,14 +43,17 @@ src/wechat_bot_bridge/
 │   └── schemas.py             # 外部请求/响应模型
 ├── application/
 │   ├── account.py             # 登录控制、退出与全量清理
+│   ├── configuration.py       # 公共 Token 与动态转发配置
 │   ├── messaging.py           # 同步发送编排
 │   ├── payloads.py            # 统一载荷校验
 │   └── typing.py              # 管理页面输入状态租约
 ├── bootstrap/
 │   ├── app.py                 # FastAPI 生命周期与依赖装配
-│   └── cli.py                 # serve
+│   ├── cli.py                 # serve
+│   └── single_instance.py     # 部署数据目录单实例锁
 ├── core/
 │   ├── config.py              # WBB_* 配置
+│   ├── paths.py               # 源码/冻结程序路径策略
 │   └── logging.py             # 安全结构化日志
 ├── domain/
 │   ├── models.py              # 领域模型
@@ -87,6 +93,7 @@ src/wechat_bot_bridge/
     │   ├── page.py             # HTML 页面
     │   ├── account.py          # 登录、状态与退出
     │   ├── messages.py         # 历史、媒体与发送
+    │   ├── configuration.py    # Token 与转发管理接口
     │   └── realtime.py         # WebSocket 事件
     ├── schemas.py
     ├── security.py             # Basic Auth 与短期页面令牌
@@ -116,11 +123,10 @@ Copy-Item .env.example .env
 New-Item -ItemType Directory -Force data/wechat
 ```
 
-编辑 `.env`，必须替换以下两个示例值，而且不要复用同一个密钥：
+编辑 `.env`，必须设置管理页面密码：
 
 ```dotenv
-WBB_API_KEY=<外部系统使用的高熵随机值，至少 16 字符>
-WBB_WEB_PASSWORD=<管理页面使用的不同密码，至少 12 字符>
+WBB_WEB_PASSWORD=<管理页面密码，至少 12 字符>
 ```
 
 Linux 宿主机还需让容器内的非 root 用户（UID/GID `10001`）可写数据目录：
@@ -156,13 +162,16 @@ curl http://127.0.0.1:8000/health/live
 `/health/ready` 只检查服务和微信监听是否就绪，不检查 owner 是否已建立；
 owner 缺失时发送接口会返回 `409 owner_not_bound`。
 
+公共 API Token 会在首次启动时自动生成。进入 `/admin` 后，点击左侧
+“公共 API Token”菜单即可查看和复制，不需要也不支持通过 `.env` 配置。
+
 ## 使用外部通知接口
 
 文字通知可以直接调用：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/v1/messages \
-  -H "Authorization: Bearer <WBB_API_KEY>" \
+  -H "Authorization: Bearer <从管理页面复制的 Token>" \
   -H "Content-Type: application/json" \
   -d '{"type":"text","text":"自动化任务已完成"}'
 ```
@@ -188,7 +197,9 @@ curl -X POST http://127.0.0.1:8000/api/v1/messages \
 - 直接发送文字、图片或文件；
 - 在输入框键入时自动向微信同步“正在输入”，停止输入后自动取消；
 - 将微信发来的原生引用按只读快照展示；精确匹配到本地入站或 Bot 出站历史时可点击引用框定位原文并闪高两次，不提供右键引用或 Bot 主动引用；
-- 通过 WebSocket 接收实时更新，断线后自动重连，并可通过历史接口恢复。
+- 通过 WebSocket 接收实时更新，断线后自动重连，并可通过历史接口恢复；
+- 查看、复制和轮换公共 API Token；轮换后旧 Token 立即失效；
+- 配置单向消息转发的协议、地址、端口、路径、HMAC Secret、超时和最大尝试次数；
 - 通过原生 HTML 表单退出登录；该请求同时要求 Basic Auth 和短期页面令牌，成功后清除全部本地账号数据并回到扫码界面。
 
 原生引用属于微信入站能力。服务保存入站顶层 `WeixinMessage.message_id`、
@@ -197,9 +208,9 @@ curl -X POST http://127.0.0.1:8000/api/v1/messages \
 的正文，点击引用框会定位并闪高原消息；没有精确目标时仍展示上游快照，但
 不猜测目标。管理页面和外部接口均不接受 Bot 出站引用字段。
 
-管理页面的 Basic 凭据与外部 Bearer API Key 相互独立。没有配置 `WBB_WEB_PASSWORD` 时，`/admin` 返回 `503 web_admin_disabled`。生产环境跨主机访问时必须放在 HTTPS 反向代理或私有网络后，不要把 Basic Auth 明文暴露在不可信网络。
+管理页面的 Basic 凭据与外部 Bearer Token 相互独立。登录管理页面后，Token 和转发配置操作不再重复要求密码。没有配置 `WBB_WEB_PASSWORD` 时，`/admin` 返回 `503 web_admin_disabled`。生产环境跨主机访问时必须放在 HTTPS 反向代理或私有网络后，不要把 Basic Auth 明文暴露在不可信网络。
 
-退出是不可撤销的本地清理操作：SQLite 五张业务表中的聊天、媒体、owner、cursor、去重和审计记录都会删除，`credentials.json` 也会删除。页面会广播账号重置事件，使其他已打开的管理页面丢弃缓存视图；宿主机映射的数据库文件和目录本身会保留，以便立即重新登录。
+退出是不可撤销的账号数据清理操作：SQLite 五张业务表中的聊天、媒体、owner、cursor、去重和审计记录都会删除，`credentials.json` 也会删除。公共 API Token 和单向转发配置属于服务级配置，会保留不变。页面会广播账号重置事件，使其他已打开的管理页面丢弃缓存视图；宿主机映射的数据库文件和目录本身会保留，以便立即重新登录。
 
 ## 微信入站与统一处理
 
@@ -207,16 +218,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/messages \
 
 1. `ChatHistorySink`：写入 `chat_messages` 并广播 WebSocket；
 2. `LoggingSink`：只记录脱敏元数据；
-3. 可选 `WebhookSink`：使用独立密钥签名转发。
+3. `OutboundForwardingSink`：启用时按当前页面配置使用独立 HMAC Secret 转发。
 
-配置 Webhook：
+进入 `/admin` 左侧“消息转发”页面配置目标。默认关闭，保存后从下一条微信
+入站事件开始生效，无需重启。该功能只主动发送，不接收下游执行结果；下游
+需要通知微信时仍调用公共 `POST /api/v1/messages`。
 
-```dotenv
-WBB_INBOUND_WEBHOOK_URL=https://example.internal/hooks/wechat
-WBB_INBOUND_WEBHOOK_SECRET=<另一个高熵随机值>
-```
-
-Webhook 使用有界进程内队列和有限重试，不提供重启续投。需要可靠消费时，
+单向转发使用有界进程内队列和有限重试，不提供重启续投。需要可靠消费时，
 下游应快速落盘并按 `event_id` 去重。
 
 ## 本地开发
@@ -246,11 +254,51 @@ uv run mypy src
 uv build
 ```
 
+## Windows 单文件 EXE
+
+在 Windows x64 开发机运行：
+
+```powershell
+.\scripts\build-windows.ps1
+.\scripts\test-windows-release.ps1 -SkipBuild
+```
+
+脚本使用 `build/uv-pyinstaller` 独立环境，不会改动正在运行 Bridge 的项目 `.venv`。产物：
+
+```text
+dist/wechat-bot-bridge-windows-x64/
+├── wechat-bot-bridge.exe
+├── windows.env.example
+├── README-WINDOWS.txt
+├── LICENSE
+└── SHA256SUMS.txt
+dist/wechat-bot-bridge-windows-x64.zip
+```
+
+复制 `windows.env.example` 为 EXE 同目录的 `.env`，设置独立的
+`WBB_WEB_PASSWORD` 后，可以双击 EXE；无参数启动会默认执行 `serve`。也可以在终端运行：
+
+```powershell
+.\wechat-bot-bridge.exe serve
+```
+
+EXE 同目录只放程序和 `.env`。默认持久数据位于：
+
+```text
+%LOCALAPPDATA%\wechat-bot-bridge\
+├── wechat-bridge.db
+├── wechat-bot-bridge.lock
+└── wechat\credentials.json
+```
+
+单文件启动器会把只读代码和页面资源释放到临时目录，但 SQLite、锁文件和微信授权不会进入
+临时目录或 EXE。一个持久化目录只允许一个 Bridge 进程。完整安装、迁移、升级与排障见
+[Windows EXE 部署](docs/windows-exe.md)。Docker 和 uv 启动方式保持不变。
+
 ## 配置
 
 | 变量 | Docker 默认值 | 说明 |
 | --- | --- | --- |
-| `WBB_API_KEY` | 必填 | 外部 `POST /api/v1/messages` 的 Bearer Key，至少 16 字符 |
 | `WBB_WEB_USERNAME` | `admin` | 管理页面 Basic Auth 用户名 |
 | `WBB_WEB_PASSWORD` | 未设置 | 管理页面独立密码；未设置时页面关闭，至少 12 字符 |
 | `WBB_WEB_TOKEN_TTL_SECONDS` | `3600` | 页面写操作和 WebSocket 短期令牌有效期 |
@@ -261,16 +309,21 @@ uv build
 | `WBB_DATA_DIR` | `/data` | 持久化根目录 |
 | `WBB_DATABASE_PATH` | `/data/wechat-bridge.db` | SQLite 路径 |
 | `WBB_CREDENTIALS_PATH` | `/data/wechat/credentials.json` | 明文 iLink 授权文件 |
-| `WBB_INBOUND_WEBHOOK_URL` | 未设置 | 可选入站转发地址 |
-| `WBB_INBOUND_WEBHOOK_SECRET` | 未设置 | Webhook HMAC 密钥 |
 | `WBB_INBOUND_QUEUE_SIZE` | `1000` | 入站分发队列容量 |
 | `WBB_INBOUND_MEDIA_DOWNLOAD_TIMEOUT_SECONDS` | `30` | 微信入站媒体单次下载超时秒数 |
-| `WBB_WEBHOOK_TIMEOUT_SECONDS` | `8` | 单次 Webhook 超时 |
-| `WBB_WEBHOOK_MAX_ATTEMPTS` | `3` | Webhook 最大尝试次数 |
 | `WBB_MESSAGE_MAX_CHARS` | `16000` | 单条文本最大字符数 |
 | `WBB_MEDIA_MAX_BYTES` | `20971520` | 解码后媒体上限，绝对上限 25 MiB |
 | `WBB_HOST_PORT` | `8000` | Compose 宿主机回环端口 |
 | `UV_DEFAULT_INDEX` | 阿里云镜像 | uv/PyPI 索引 |
+
+上表为 Docker Compose 值。Windows EXE 未显式设置路径变量时，`WBB_HOST` 默认
+`127.0.0.1`，三个持久化路径默认位于 `%LOCALAPPDATA%\wechat-bot-bridge`；冻结程序只从
+EXE 同目录读取 `.env`，不依赖启动时的当前工作目录。
+
+服务级配置由 `/admin` 页面写入 SQLite `service_settings`：公共 API Token
+自动生成；消息转发默认关闭，默认目标为
+`http://127.0.0.1:8765/v1/sources/wechat-bridge/events`，单次超时 8 秒，
+最大尝试 3 次。Token 和 HMAC Secret 都可在页面复制和轮换。
 
 保持单进程、单 Uvicorn worker和单 iLink 长轮询消费者。横向扩容前必须先实现 poller 租约、共享队列和支持并发协调的存储。
 
