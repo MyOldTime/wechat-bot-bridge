@@ -10,9 +10,37 @@ from pydantic import ValidationError
 from wechat_bot_bridge.core.config import Settings
 
 
+def test_source_startup_reads_working_directory_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("WBB_PORT", raising=False)
+    monkeypatch.delenv("WBB_WEB_PASSWORD", raising=False)
+    (tmp_path / ".env").write_text(
+        "WBB_PORT=8127\nWBB_WEB_PASSWORD=source-example-password\n", encoding="utf-8"
+    )
+    settings = Settings()
+    assert settings.port == 8127
+    assert settings.web_password is not None
+    assert settings.web_password.get_secret_value() == "source-example-password"
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["https://*.example.test", "https://private@bridge.test", "https://bridge.test/mcp"],
+)
+def test_mcp_public_origin_requires_an_exact_origin(
+    origin: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("WBB_MCP_PUBLIC_ORIGIN", origin)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
 def test_settings_defaults_are_safe() -> None:
     settings = Settings(_env_file=None)
 
+    assert settings.mcp_public_origin is None
     assert settings.host == "127.0.0.1"
     assert settings.port == 8000
     assert settings.media_max_bytes == 20 * 1024 * 1024

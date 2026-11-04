@@ -1,4 +1,4 @@
-"""公共 API 凭据和单向消息转发配置。"""
+"""MCP 凭据和单向消息转发配置。"""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def _new_forwarding_secret() -> str:
 
 
 class PublicApiCredentialService:
-    """生成、持久化并恒定时间校验唯一公共 API Token。"""
+    """生成、持久化并恒定时间校验 MCP Token。"""
 
     def __init__(self, store: ServiceConfigurationStore) -> None:
         self._store = store
@@ -66,7 +66,7 @@ class PublicApiCredentialService:
 
     async def matches(self, provided: str) -> bool:
         expected = (await self.current()).token
-        return secrets.compare_digest(provided, expected)
+        return secrets.compare_digest(provided if provided.isascii() else "", expected)
 
     async def rotate(self) -> PublicApiTokenSnapshot:
         async with self._lock:

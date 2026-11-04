@@ -9,17 +9,15 @@
     <meta name="media-max-bytes" content="{{ media_max_bytes }}">
     <meta name="typing-timeout-seconds" content="{{ typing_timeout_seconds }}">
     <title>微信 Bot 对话 · wechat-bot-bridge</title>
-    <link rel="stylesheet" href="/admin/static/chat.css?v=8">
-    <script src="/admin/static/chat.js?v=8" defer></script>
+    <link rel="icon" href="/admin/static/bridge.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/admin/static/chat.css?v=9">
+    <script src="/admin/static/chat.js?v=9" defer></script>
   </head>
   <body>
     <main class="app-shell">
       <aside class="sidebar" aria-label="会话列表">
         <div class="brand">
-          <div class="brand-mark" aria-hidden="true">
-            <span></span>
-            <span></span>
-          </div>
+          <img class="brand-mark" src="/admin/static/bridge.svg" alt="" width="39" height="39">
           <div>
             <strong>微信桥接</strong>
             <small>wechat-bot-bridge</small>
@@ -41,7 +39,7 @@
           <button id="open-token-settings" class="sidebar-menu-button" type="button">
             <span class="sidebar-menu-icon" aria-hidden="true">钥</span>
             <span>
-              <strong>公共 API Token</strong>
+              <strong>MCP Token</strong>
               <small>查看、复制与轮换</small>
             </span>
           </button>
@@ -133,8 +131,8 @@
             <section id="token-settings" class="settings-section" hidden>
               <div class="settings-section-heading">
                 <div>
-                  <h3>公共 API Token</h3>
-                  <p>外部程序调用 <code>POST /api/v1/messages</code> 时使用该 Bearer Token。</p>
+                  <h3>MCP Token</h3>
+                  <p>MCP 客户端连接本服务的 <code>/mcp</code> 时使用该 Bearer Token。</p>
                 </div>
                 <span class="settings-badge">立即生效</span>
               </div>

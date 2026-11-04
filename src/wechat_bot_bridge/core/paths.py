@@ -24,12 +24,19 @@ def executable_directory() -> Path:
     return Path.cwd()
 
 
-def default_environment_file() -> Path:
-    """源码从当前目录读取 .env；冻结程序固定读取 EXE 同目录的 .env。"""
+def default_environment_file() -> Path | None:
+    """只有源码运行时从当前目录加载 .env。"""
 
-    if is_frozen():
-        return executable_directory() / ".env"
-    return Path(".env")
+    return None if is_frozen() else Path(".env")
+
+
+def desktop_config_file() -> Path:
+    """Windows 用户配置独立于 EXE 位置、启动目录和可自定义的数据目录。"""
+
+    root = Path(os.environ.get("LOCALAPPDATA", ""))
+    if not root.is_absolute():
+        root = Path.home() / "AppData" / "Local"
+    return root / APPLICATION_DIRECTORY / "config" / "settings.json"
 
 
 def _frozen_data_directory(
@@ -43,7 +50,7 @@ def _frozen_data_directory(
 
     if platform == "win32":
         local_app_data = environment.get("LOCALAPPDATA")
-        if local_app_data:
+        if local_app_data and Path(local_app_data).is_absolute():
             return Path(local_app_data) / APPLICATION_DIRECTORY
         return executable_dir / "data"
     if platform == "darwin":

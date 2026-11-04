@@ -162,7 +162,8 @@ async def _running_client(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="http://testserver",
+            base_url="http://127.0.0.1",
+            headers={"Accept": "application/json, text/event-stream"},
         ) as client:
             yield client, app, gateway
 
@@ -174,6 +175,15 @@ async def _seed_owner(app: FastAPI) -> None:
         context_token="private-context",
         credential_fingerprint=SESSION,
     )
+
+
+def _tool_call(message: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "send_wechat_message", "arguments": {"message": message}},
+    }
 
 
 async def _bearer(app: FastAPI) -> dict[str, str]:
@@ -209,14 +219,14 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
         chat_script = await client.get("/admin/static/chat.js", headers=WEB_BASIC)
         chat_style = await client.get("/admin/static/chat.css", headers=WEB_BASIC)
         basic_on_external = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers=WEB_BASIC,
-            json={"type": "text", "text": "wrong authentication"},
+            json=_tool_call({"type": "text", "text": "wrong authentication"}),
         )
         bearer_on_external = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers=bearer,
-            json={"type": "text", "text": "correct authentication"},
+            json=_tool_call({"type": "text", "text": "correct authentication"}),
         )
 
         assert missing.status_code == 401
@@ -247,6 +257,7 @@ async def test_management_basic_auth_is_separate_from_external_bearer(
         assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
         assert basic_on_external.status_code == 401
         assert bearer_on_external.status_code == 200
+        assert bearer_on_external.json()["result"]["isError"] is False
 
 
 async def test_admin_manages_public_token_and_live_forwarding_without_password_prompt(
@@ -267,14 +278,14 @@ async def test_admin_manages_public_token_and_live_forwarding_without_password_p
         )
         new_token = rotated.json()["token"]
         old_send = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers=old_bearer,
-            json={"type": "text", "text": "旧 Token 不应继续有效"},
+            json=_tool_call({"type": "text", "text": "旧 Token 不应继续有效"}),
         )
         new_send = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers={"Authorization": f"Bearer {new_token}"},
-            json={"type": "text", "text": "新 Token 已生效"},
+            json=_tool_call({"type": "text", "text": "新 Token 已生效"}),
         )
 
         default_forwarding = await client.get(
@@ -333,6 +344,7 @@ async def test_admin_manages_public_token_and_live_forwarding_without_password_p
         assert new_token != old_token
         assert old_send.status_code == 401
         assert new_send.status_code == 200
+        assert new_send.json()["result"]["isError"] is False
         assert default_forwarding.status_code == 200
         assert default_forwarding.json()["enabled"] is False
         assert default_forwarding.json()["target_url"] == (
@@ -416,9 +428,9 @@ async def test_admin_logout_form_clears_all_state_and_restarts_login(
         await app.state.dispatcher.publish(inbound)
         await app.state.dispatcher.drain()
         sent = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers=bearer,
-            json={"type": "text", "text": "也需要被清除"},
+            json=_tool_call({"type": "text", "text": "也需要被清除"}),
         )
         assert sent.status_code == 200
 
@@ -472,18 +484,20 @@ async def test_chat_api_shows_full_content_and_media_only_with_basic_auth(
         await _seed_owner(app)
         bearer = await _bearer(app)
         text_response = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers=bearer,
-            json={"type": "text", "text": "自动化任务已完成"},
+            json=_tool_call({"type": "text", "text": "自动化任务已完成"}),
         )
         image_response = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers=bearer,
-            json={
-                "type": "image",
-                "content_base64": encoded,
-                "caption": "任务截图",
-            },
+            json=_tool_call(
+                {
+                    "type": "image",
+                    "content_base64": encoded,
+                    "caption": "任务截图",
+                }
+            ),
         )
         unauthorized = await client.get("/admin/api/messages")
         page = await client.get("/admin/api/messages", headers=WEB_BASIC)
@@ -496,7 +510,7 @@ async def test_chat_api_shows_full_content_and_media_only_with_basic_auth(
             "自动化任务已完成",
             "任务截图",
         ]
-        assert all(item["origin"] == "external_api" for item in page.json()["items"])
+        assert all(item["origin"] == "mcp" for item in page.json()["items"])
 
         image = page.json()["items"][1]
         media_unauthorized = await client.get(image["media_url"])
@@ -733,7 +747,9 @@ async def test_admin_history_rejects_invalid_cursor_and_exposes_status(
 
 def test_websocket_pushes_external_message_status_changes(tmp_path: Path) -> None:
     app, _gateway = _app(tmp_path)
-    with TestClient(app) as client:
+    with TestClient(
+        app, base_url="http://127.0.0.1", headers={"Accept": "application/json, text/event-stream"}
+    ) as client:
         assert client.portal is not None
         client.portal.call(app.state.store.activate_session, SESSION)
         client.portal.call(
@@ -755,9 +771,9 @@ def test_websocket_pushes_external_message_status_changes(tmp_path: Path) -> Non
             snapshot = client.portal.call(app.state.public_api_credentials.current)
             bearer = {"Authorization": f"Bearer {snapshot.token}"}
             response = client.post(
-                "/api/v1/messages",
+                "/mcp",
                 headers=bearer,
-                json={"type": "text", "text": "实时展示这条消息"},
+                json=_tool_call({"type": "text", "text": "实时展示这条消息"}),
             )
             sending = websocket.receive_json()
             sent = websocket.receive_json()

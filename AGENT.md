@@ -9,34 +9,34 @@
 - Python：精确使用 `3.12.13`
 - 依赖管理：uv；必须提交并遵守 `uv.lock`
 - CLI：只保留 `wechat-bot-bridge serve`；微信扫码登录由 `/admin` 驱动
-- 外部业务接口：仅 `POST /api/v1/messages`
-- 外部 Bearer Token：首次启动自动生成并保存为服务配置，在 `/admin` 的“公共 API Token”页面查看、复制和轮换
+- 外部业务入口：`/mcp` 上的 Streamable HTTP MCP 工具 `send_wechat_message`
+- 外部 Bearer Token：首次启动自动生成并保存为服务配置，在 `/admin` 的“MCP Token”页面查看、复制和轮换
 - 管理页面：`/admin`，使用与外部 Bearer 分离的 Basic Auth
-- 配置前缀：`WBB_`
+- 配置前缀：`WBB_`。源码开发读取工作目录 `.env`，Windows EXE 只读取用户配置目录的 `settings.json`。
 - 源码分层：`api/`、`application/`、`bootstrap/`、`core/`、`domain/`、`infrastructure/`、`web/`
 - 包目录使用 Python 3.12 隐式命名空间，不保留仅用于占位的 `__init__.py`
 - Docker 持久化根目录：`/data`
 - 凭据路径：`/data/wechat/credentials.json`
 - 部署模型：单进程、单 Uvicorn worker、单 iLink 长轮询消费者
-- Windows 发布：PyInstaller one-file；无参数 EXE 入口映射到唯一 `serve`，模板和静态资源
-  嵌入程序，持久数据默认位于 `%LOCALAPPDATA%\wechat-bot-bridge`
+- Windows 发布：PyInstaller one-file GUI；双击 EXE 启动托盘和唯一 Uvicorn 服务，程序与
+  托盘使用同一组多尺寸 ICO 资源，模板和静态资源嵌入程序，持久数据默认位于 `%LOCALAPPDATA%\wechat-bot-bridge`。同根目录下的 `config/settings.json` 缺失时自动创建并生成随机管理密码。已有文件不得静默重写。
 
 ## 不可违反的能力边界
 
 本项目基于微信 iLink Bot，不是桌面个人微信 Hook 或客户端注入。不要把功能、文档或测试描述成“监听全部个人微信会话”，也不要声称支持普通个人微信群。当前 ClawBot 是扫码账号与 Bot 之间的一对一私密通道；主动发送只能使用扫码账号先向 Bot 私聊后获得的唯一 owner 会话上下文，不得提供联系人列表、任意 `user_id` 目标或绕过该限制的伪接口。社区观察到主动互动窗口通常约为 24 小时，且窗口内仍有限频；上游 `ret=-2` 可能对应上下文过期或限频，不能硬编码成唯一原因。
 
-`credentials.json` 是明文敏感授权文件。公共 API Token、管理密码、页面令牌、转发 HMAC Secret、上游 token 和 `context_token` 不得进入 Git、测试快照、异常响应或日志。公共 API Token 和转发 Secret 只能通过 Basic Auth 保护且 `no-store` 的管理接口显示。不要读取并输出真实 `data/` 内容。示例只能使用明显的假值。聊天正文和媒体只允许出现在 SQLite、微信/单向转发业务载荷和已通过 Basic Auth 的管理端，不得写入普通日志。
+`credentials.json` 是明文敏感授权文件。MCP Token、管理密码、页面令牌、转发 HMAC Secret、上游 token 和 `context_token` 不得进入 Git、测试快照、异常响应或日志。MCP Token 和转发 Secret 只能通过 Basic Auth 保护且 `no-store` 的管理接口显示。不要读取并输出真实 `data/` 内容。示例只能使用明显的假值。聊天正文和媒体只允许出现在 SQLite、微信/单向转发业务载荷和已通过 Basic Auth 的管理端，不得写入普通日志。
 
 ## 架构约束
 
 保持以下依赖方向：
 
 ```text
-API/Web/CLI -> application services -> domain ports <- infrastructure adapters
+MCP/Web/CLI -> application services -> domain ports <- infrastructure adapters
 ```
 
 - 路由只处理认证、校验和 HTTP 映射，不直接调用 iLink 原始 API。
-- `api/external.py` 只提供 `POST /api/v1/messages`；健康检查放在 `api/health.py`，不创建聚合式 `router.py`。
+- `api/external.py` 只注册 MCP 发送工具。官方 SDK 负责握手、发现、调用和协议协商，传输与微信网关共享 FastAPI lifespan。健康检查放在 `api/health.py`。
 - `web/` 管理页面必须保持服务端模板与同源静态资源结构；页面内部接口不得混入外部 OpenAPI。
 - 应用服务编排唯一 owner 解析、消息创建、同步发送和审计状态迁移。
 - `domain/` 不得导入 FastAPI、SQLite、HTTP 客户端或 iLink 协议模型；跨层依赖通过 `domain/ports.py`。
@@ -65,9 +65,9 @@ API/Web/CLI -> application services -> domain ports <- infrastructure adapters
 - 持久层不得把 `context_token` 返回到 API 或 Webhook；除入站 Webhook 契约中的 `sender.user_id` 外，HTTP 业务响应不得暴露 owner 的 `user_id`。
 - 所有后台任务都必须挂到应用 lifespan，支持 SIGTERM 和可预测清理。
 - 保持一个长轮询所有者。没有分布式租约、共享队列和并发数据库设计前，不得启用多个 Uvicorn worker 或多副本。
-- CLI 在打开 SQLite 前必须持有部署数据目录的单实例文件锁；锁文件不得包含 PID 之外的敏感
+- CLI 和托盘入口在打开 SQLite 前必须持有部署数据目录的单实例文件锁；锁文件不得包含 PID 之外的敏感
   上下文，也不能依赖端口冲突来保护数据库与长轮询。
-- 冻结程序只能把代码、依赖、模板和静态资源放入 one-file；`.env`、SQLite、微信授权、聊天
+- 冻结程序只能把代码、依赖、模板和静态资源放入 one-file；`.env`、用户配置、SQLite、微信授权、聊天
   正文和真实 Token 必须留在 EXE 外部。源码/Docker 路径语义不得因冻结发布而改变。
 
 完整说明见 `docs/architecture.md`。
@@ -109,22 +109,22 @@ UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 - 不使用可变全局单例保存请求状态。
 - SQLite 操作必须参数化；迁移要前向兼容并有测试。
 - `chat_messages` 保存管理页面需要的完整内容、方向、来源、状态、账号隔离的顶层消息/item 哈希关联键和微信入站原生引用快照/精确目标；正文、媒体、关联键和 owner 上下文不得错误地进入外部 API。原始微信 `msg_id` 只允许在对应的受认证同步发送响应中返回，不得持久化、写日志、进入管理历史或 Webhook。
-- `POST /api/v1/messages` 每次调用都创建不同消息；不得接收或依赖外部 `Idempotency-Key`。
+- `send_wechat_message` 每次有效发送都创建不同消息。JSON-RPC 请求 ID 不参与幂等处理。
 - 消息 ID 由服务内部生成。调用方网络重试会形成新消息，API 和文档必须明确提示重复通知风险。
-- 发送必须在当前 HTTP 请求中同步调用微信；成功返回 `200` 和终态 `sent`，可预期失败直接映射为稳定的 `4xx/5xx`，服务端不执行后台自动重试。
-- 请求必须以 `type` 构成判别联合；当前允许 `text`、`image`、`file`、`typing_start` 和 `typing_cancel`。二进制只接受标准 Base64，并同时受 schema 硬上限和 `WBB_MEDIA_MAX_BYTES` 约束。
-- 外部公开契约仅包含 `POST /api/v1/messages`；聊天查询、收件人和微信状态只属于管理端内部能力，不得暴露到 `/api/v1`。
+- 发送必须在当前工具调用中同步调用微信。成功返回结构化回执和终态 `sent`，业务失败使用 `isError` 和稳定错误码，服务端不执行后台自动重试。
+- 工具的 `message` 参数必须以 `type` 构成判别联合；当前允许 `text`、`image`、`file`、`typing_start` 和 `typing_cancel`。二进制只接受标准 Base64，并同时受 schema 硬上限和 `WBB_MEDIA_MAX_BYTES` 约束。
+- 外部公开契约只公布发送工具。聊天查询、收件人和微信状态只属于管理端内部能力。
 - 管理历史只在 Basic Auth 下通过 `/admin/api/messages` 提供，使用不可变的 `occurred_at + id` 游标，不使用 offset。
 - 管理历史可以返回完整正文和受保护媒体 URL，但不得返回 owner `user_id`、`context_token` 或任何授权材料。
 - 管理页面键入触发的微信输入状态必须由浏览器定时器和服务端 `TypingLeaseService` 双重收口；正文发送和 lifespan 关闭前应尽力取消活动租约。
 - 管理端与外部发送请求使用相同的消息载荷边界，均不得接受 `quote_msg_id`、`quote_message_id`、`ref_msg` 或其他引用字段。微信入站原生引用只作为只读内容进入历史与实时事件，精确匹配的目标消息 ID 仅用于管理页定位原文。
 - 管理页面 HTTP 全部使用 Basic Auth；外部 Bearer 不得获得管理权限。JSON 写操作另需短期 `X-Admin-Token`；退出使用 URL 编码表单中的短期签名令牌；WebSocket 使用子协议头传递短期签名令牌，不得把令牌放入 URL。
-- 公共 API Token 与单向转发配置保存在 `service_settings`，不得使用环境变量维护；Token/Secret 轮换后立即替换进程内快照，完整值只允许从受保护管理接口返回。
+- MCP Token 与单向转发配置保存在 `service_settings`，不得使用环境变量维护；Token/Secret 轮换后立即替换进程内快照，完整值只允许从受保护管理接口返回。
 - `POST /admin/logout` 必须清除授权文件、`chat_messages`、`inbound_events`、`outbound_messages`、`recipients`、`bridge_state` 和进程内页面队列，再启动新的扫码流程并 `303` 返回 `/admin`；不得清除 `service_settings`。
-- `WBB_WEB_PASSWORD` 未配置时管理端必须显式关闭，不能回退为无认证模式。
-- HTTP 发送目标固定为 `owner`，请求体不得接收 `recipient`、`user_id` 或 alias。
+- 源码或 Docker 部署未配置 `WBB_WEB_PASSWORD` 时管理端必须显式关闭。Windows EXE 为首次启动生成密码，已有配置缺少有效密码时停止启动。所有模式均不得回退为无认证模式。
+- 所有发送目标固定为 `owner`，工具和页面不得接收 `recipient`、`user_id` 或 alias。
 - 只有与当前授权凭据 `user_id` 完全一致的入站发送者可以建立或刷新 owner；授权会话改变时必须清空上一会话的 owner。
-- 健康接口不鉴权但只返回最小状态；所有 `/api/v1` 业务接口必须 Bearer 鉴权。
+- 健康接口不鉴权但只返回最小状态；所有 `/mcp` 请求必须在处理协议消息前完成 Bearer 鉴权。
 - 不把 iLink wire 类型作为公共 API 模型；外部契约必须版本化。
 
 ## 测试要求
@@ -145,7 +145,7 @@ UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
 - 单向转发：关闭时不发送、原始 Body HMAC 签名、动态目标、超时、有界重试且不泄漏上下文。
 - 生命周期：启动、SIGTERM/关闭、轮询任务失败。
 - 账号生命周期：无凭据时等待页面、登录启动、二维码保护、配对数字、退出表单认证、凭据删除、队列排空、全表清理、并发发送互斥和页面 `account_reset`。
-- API/Web：外部 OpenAPI 只有一个 POST；管理页面、静态资源、CSP、状态码和响应模型。
+- MCP/Web：用标准客户端验证 initialize、工具发现、发送、校验、认证和错误结果，OpenAPI 不列业务路径。覆盖管理页面、静态资源、CSP、状态码和响应模型。
 
 测试目录应镜像源码职责，分别放在 `tests/api/`、`tests/application/`、`tests/core/`、`tests/infrastructure/` 和 `tests/web/`。测试不得访问真实微信、真实凭据或公网。通过端口/适配器注入 fake。涉及 SQLite 的测试使用独立临时目录。
 
@@ -178,7 +178,7 @@ CLI 帮助中只能出现常驻 `serve`，扫码登录统一由管理页面处�
 | 修改 | 必须同步 |
 | --- | --- |
 | 环境变量或默认值 | `.env.example`、`README.md` |
-| 外部 API 请求/响应/状态码 | `docs/external-api.md`、`docs/api.md`、相关测试 |
+| 外部 MCP 工具、参数、结果或认证 | `docs/external-api.md`、`docs/api.md`、相关测试 |
 | 管理页面、WebSocket 请求/响应/状态码 | `docs/api.md`、相关测试 |
 | 持久化路径或 schema | `docs/architecture.md`、Docker/Compose、迁移测试 |
 | CLI | `README.md`、Dockerfile、Compose 示例 |
@@ -198,5 +198,5 @@ CLI 帮助中只能出现常驻 `serve`，扫码登录统一由管理页面处�
 4. 确认没有真实密钥、凭据、数据库或个人消息进入 diff。
 5. 确认 README、外部接口、管理接口和架构文档与实际行为一致。
 6. 在交付说明中列出已执行验证和任何已知限制。
-7. 修改 Windows 打包后必须实际生成 EXE，并验证无参数启动、外部数据目录、OpenAPI、管理页面
-   和静态资源；只运行源码测试不能声称发布通过。
+7. 修改 Windows 打包后必须实际生成 EXE，并验证无参数 GUI 启动、托盘图标与退出、单实例、外部数据目录、MCP、OpenAPI、
+   管理页面和静态资源；只运行源码测试不能声称发布通过。

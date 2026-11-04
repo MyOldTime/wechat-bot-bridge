@@ -102,38 +102,7 @@ label {
 }
 
 .brand-mark {
-  position: relative;
-  width: 39px;
-  height: 35px;
   flex: 0 0 auto;
-}
-
-.brand-mark span {
-  position: absolute;
-  display: block;
-  width: 29px;
-  height: 23px;
-  border-radius: 50%;
-  background: var(--wechat);
-}
-
-.brand-mark span::after {
-  position: absolute;
-  bottom: -3px;
-  left: 5px;
-  width: 7px;
-  height: 7px;
-  content: "";
-  background: inherit;
-  transform: rotate(30deg);
-}
-
-.brand-mark span:last-child {
-  right: 0;
-  bottom: 0;
-  width: 24px;
-  height: 19px;
-  background: #f4fff8;
 }
 
 .sidebar-label {

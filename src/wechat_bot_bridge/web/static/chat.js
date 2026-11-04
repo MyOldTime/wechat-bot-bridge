@@ -99,6 +99,7 @@
 
   const labels = {
     external_api: "外部任务",
+    mcp: "MCP 工具",
     web_admin: "管理页面",
     wechat: "微信",
   };
@@ -320,7 +321,7 @@
       });
       elements.publicApiToken.value = token.token;
       elements.publicApiTokenUpdated.textContent = formatUpdatedAt(token.updated_at);
-      showToast("公共 API Token 已轮换");
+      showToast("MCP Token 已轮换");
     } catch (error) {
       showToast(error.message, "error");
     } finally {
@@ -987,7 +988,7 @@
     toggleSecretVisibility(elements.forwardingSecret, elements.toggleForwardingSecret),
   );
   elements.copyPublicApiToken.addEventListener("click", () =>
-    copySecret(elements.publicApiToken.value, "公共 API Token"),
+    copySecret(elements.publicApiToken.value, "MCP Token"),
   );
   elements.copyForwardingSecret.addEventListener("click", () =>
     copySecret(elements.forwardingSecret.value, "HMAC Secret"),

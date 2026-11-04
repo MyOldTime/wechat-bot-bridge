@@ -18,7 +18,7 @@ from .single_instance import InstanceAlreadyRunningError, single_instance
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="wechat-bot-bridge",
-        description="Bridge external HTTP notifications to a WeChat iLink Bot",
+        description="Bridge MCP notifications to a WeChat iLink Bot",
     )
     parser.add_argument(
         "--version",
@@ -26,7 +26,7 @@ def _parser() -> argparse.ArgumentParser:
         version=version("wechat-bot-bridge"),
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
-    subcommands.add_parser("serve", help="start the HTTP bridge and WeChat listener")
+    subcommands.add_parser("serve", help="start the MCP bridge and WeChat listener")
     return parser
 
 
@@ -34,7 +34,8 @@ def _load_settings(parser: argparse.ArgumentParser) -> Settings:
     try:
         return Settings()
     except ValidationError as exc:
-        parser.error(f"invalid configuration: {exc}")
+        fields = ", ".join(str(error["loc"][0]) for error in exc.errors(include_input=False))
+        parser.error(f"invalid configuration fields: {fields}")
 
 
 def main(argv: Sequence[str] | None = None) -> None:

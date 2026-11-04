@@ -1,4 +1,4 @@
-"""HTTP API 专用的请求、响应与领域转换模型。"""
+"""MCP 工具与管理页面共用的发送模型和领域转换。"""
 
 from __future__ import annotations
 
@@ -53,7 +53,12 @@ Base64Media = Annotated[
         {
             "type": "string",
             "format": "byte",
-            "description": "标准 Base64 编码的二进制内容，不含 data: URL 前缀",
+            "contentEncoding": "base64",
+            "description": (
+                "必填。将图片或文件的原始字节编码为标准 Base64 字符串。"
+                "只填编码内容，不加换行或 data: URL 前缀。解码后至少 1 字节，"
+                "最大字节数见工具说明中的当前部署上限。"
+            ),
         }
     ),
 ]
@@ -64,34 +69,58 @@ class _MessageRequest(BaseModel):
 
 
 class TextMessageRequest(_MessageRequest):
-    type: Literal["text"]
-    text: str = Field(min_length=1, max_length=100_000, description="要发送的文字")
+    type: Literal["text"] = Field(description="固定为 text，发送文字通知，必须同时填写 text。")
+    text: str = Field(
+        min_length=1,
+        max_length=100_000,
+        description=(
+            "必填正文，至少含一个非空白字符。建议用 Markdown 的短标题、换行和列表组织多行通知，"
+            "单句通知也可直接写纯文本。桥接服务按微信文本发送，保留 Markdown 标记。"
+            "总长度受部署文字上限约束，超过 4000 字符时分条发送。"
+        ),
+        examples=["## 构建完成\n- 版本：v1.2.0\n- 测试：通过"],
+    )
+
+
+_CAPTION_DESCRIPTION = (
+    "可选说明文字。省略或传 null 表示只发送媒体。填写时须含非空白字符，"
+    "最多 4000 字符，同时受部署文字上限约束。说明先作为单独的文字消息发送。"
+)
 
 
 class ImageMessageRequest(_MessageRequest):
-    type: Literal["image"]
+    type: Literal["image"] = Field(
+        description="固定为 image，发送微信图片。必填 content_base64，可选 caption。"
+    )
     content_base64: Base64Media
     caption: str | None = Field(
         default=None,
         min_length=1,
         max_length=4_000,
-        description="可选的图片说明",
+        description=_CAPTION_DESCRIPTION,
     )
 
 
 class FileMessageRequest(_MessageRequest):
-    type: Literal["file"]
+    type: Literal["file"] = Field(
+        description="固定为 file，发送普通文件。必填 content_base64 和 file_name，可选 caption。"
+    )
     content_base64: Base64Media
     file_name: str = Field(
         min_length=1,
         max_length=255,
-        description="收件人在微信中看到的文件名",
+        description=(
+            "收件人看到的文件名，必填，最多 255 字符。不能仅含空白，不能含路径分隔符或 NUL。"
+            f"图片扩展名 {'、'.join(sorted(_IMAGE_EXTENSIONS))} 须改用 image。"
+            f"不支持视频扩展名 {'、'.join(sorted(_VIDEO_EXTENSIONS))}。"
+        ),
+        examples=["report.pdf"],
     )
     caption: str | None = Field(
         default=None,
         min_length=1,
         max_length=4_000,
-        description="可选的文件说明",
+        description=_CAPTION_DESCRIPTION,
     )
 
     @field_validator("file_name")
@@ -111,11 +140,15 @@ class FileMessageRequest(_MessageRequest):
 
 
 class TypingStartRequest(_MessageRequest):
-    type: Literal["typing_start"]
+    type: Literal["typing_start"] = Field(
+        description="固定为 typing_start，显示“正在输入”。只传 type，结束时调用 typing_cancel。"
+    )
 
 
 class TypingCancelRequest(_MessageRequest):
-    type: Literal["typing_cancel"]
+    type: Literal["typing_cancel"] = Field(
+        description="固定为 typing_cancel，取消“正在输入”提示。只传 type，不产生聊天气泡。"
+    )
 
 
 type SendMessageRequest = Annotated[
@@ -126,6 +159,17 @@ type SendMessageRequest = Annotated[
     | TypingCancelRequest,
     Field(discriminator="type"),
 ]
+
+
+class SendToolArguments(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    message: SendMessageRequest = Field(
+        description=(
+            "必填对象。向当前绑定的唯一微信账号发送一个动作。用 type 选择 text、image、file、"
+            "typing_start 或 typing_cancel，只填写该类型的字段，无需指定收件人。"
+        )
+    )
 
 
 def to_domain_payload(request: SendMessageRequest) -> OutboundPayload:
@@ -151,15 +195,28 @@ class SendMessageResponse(BaseModel):
 
     model_config = ConfigDict(populate_by_name=True)
 
-    id: str
+    id: str = Field(description="本次发送的本地审计 UUID。重复发送相同内容会取得新的 id。")
     msg_id: str | None = Field(
         default=None,
-        description=("微信服务端为主消息分配的 ID；输入状态或上游未返回 ID 时为 null"),
+        description=(
+            "微信返回的主消息 ID，以字符串表示。长文字取第一段，带说明的媒体取图片或文件本身。"
+            "输入状态或上游未返回 ID 时为 null。"
+        ),
     )
-    message_type: OutboundMessageType = Field(serialization_alias="type")
-    status: Literal["sent"]
-    created_at: datetime
-    sent_at: datetime
+    message_type: OutboundMessageType = Field(
+        serialization_alias="type",
+        description=(
+            "已执行的动作，与请求的 message.type 相同。"
+            "取值为 text、image、file、typing_start 或 typing_cancel。"
+        ),
+    )
+    status: Literal["sent"] = Field(
+        description="成功回执固定为 sent，表示微信 iLink 已接受该动作，不代表对方已读。"
+    )
+    created_at: datetime = Field(description="本地创建审计记录的时间，使用 UTC 的 RFC 3339 格式。")
+    sent_at: datetime = Field(
+        description="iLink 接受动作后本地记录成功的时间，使用 UTC 的 RFC 3339 格式。"
+    )
 
     @classmethod
     def from_domain(cls, message: OutboundMessage) -> SendMessageResponse:

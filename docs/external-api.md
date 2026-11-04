@@ -1,395 +1,157 @@
-# 外部消息接口对接指南
+# MCP 通知微信接入指南
 
-本文面向自动化任务、CI/CD、定时任务、告警系统和其他业务程序，说明如何通过
-`wechat-bot-bridge` 向唯一微信 owner 发送通知。
+## 从原 HTTP 接口迁移
 
-## 1. 接口概览
+原 `POST /api/v1/messages` 已移除。现在由 MCP 客户端连接运行中的 Bridge，
+调用 `send_wechat_message` 向唯一微信 owner 发送通知。原 Bearer Token、已绑定账号和
+聊天记录可以继续使用。原请求体放在工具参数的 `message` 字段中。
 
-| 项目 | 值 |
-| --- | --- |
-| 方法 | `POST` |
-| 路径 | `/api/v1/messages` |
-| 认证 | `Authorization: Bearer <从 /admin 复制的公共 API Token>` |
-| 请求格式 | `application/json` |
-| 成功状态 | `200 OK` |
-| 发送模式 | 同步 |
-| 收件人 | 当前授权账号对应的唯一 `owner` |
+微信入站事件转发给下游仍使用单向 HTTP Webhook，由管理页单独配置。
+[入站转发契约](api.md#4-单向消息转发)
 
-服务的 OpenAPI 定义位于 `/openapi.json`，交互式页面位于 `/docs`。公开业务
-契约只包含这个 POST；聊天记录、管理状态和登录操作属于 `/admin` 管理端。
+## 连接 Bridge
 
-## 2. 接入前准备
+1. 启动 Bridge。Windows 发布版双击 EXE，从托盘“打开配置目录”的 `settings.json` 查看首次生成的管理密码，再打开管理页面。源码或 Docker 部署访问 `/admin`。
+2. 使用管理用户名和密码登录，完成微信扫码。用扫码账号先给 Bot 私聊一条消息，建立 owner 上下文。
+3. 在管理页的“MCP Token”中复制 Bearer Token。
+4. 将 MCP 客户端的传输设为 **Streamable HTTP**，地址填 `http://127.0.0.1:8000/mcp`，请求头填
+   `Authorization: Bearer <从管理页复制的 Token>`。修改监听端口后，客户端地址也要对应修改。
 
-调用前应满足：
-
-1. 服务进程正常，`GET /health/live` 返回 `200 {"status":"ok"}`；
-2. 管理员已访问 `/admin` 并完成微信扫码授权；
-3. 完成扫码的微信账号已主动向 Bot 发送至少一条私聊消息；
-4. `GET /health/ready` 返回 `200 {"status":"ready"}`；
-5. 调用方已从 Bridge `/admin` 左侧“公共 API Token”页面复制当前 Token。
-
-扫码只完成账号授权。第 3 步用于建立主动发送所需的唯一 owner 会话上下文，
-因此不能省略。接口不接受收件人 ID、联系人名称或收件人列表。
-
-建议调用方配置：
-
-```text
-WBB_BRIDGE_URL=http://127.0.0.1:8000
-BRIDGE_API_TOKEN=<从 Bridge 管理页面复制的 Token>
-```
-
-跨主机调用必须使用 HTTPS 反向代理或受控私网，不要通过明文公网 HTTP 传输
-Bearer Token、消息正文或媒体内容。
-
-## 3. 认证
-
-每次请求必须携带：
-
-```http
-Authorization: Bearer <BRIDGE_API_TOKEN>
-Content-Type: application/json
-```
-
-认证失败：
-
-```http
-HTTP/1.1 401 Unauthorized
-WWW-Authenticate: Bearer
-```
+例如，VS Code 本地客户端可以在用户的 `mcp.json` 中添加以下配置。连接时在密码框中输入 Token。
 
 ```json
 {
-  "detail": {
-    "code": "unauthorized",
-    "message": "Invalid or missing credentials"
-  }
-}
-```
-
-Token 不应放入 URL、请求体、代码仓库、构建日志或异常消息。Token 由 Bridge
-首次启动自动生成；管理员可以在页面复制或轮换，轮换后旧值立即失效。
-
-## 4. 请求模型
-
-所有请求都使用 `type` 作为判别字段。未知字段会被拒绝。
-
-### 4.1 文字
-
-```json
-{
-  "type": "text",
-  "text": "自动化任务已完成"
-}
-```
-
-约束：
-
-- `text` 必填；
-- 不能是空字符串或纯空白；
-- 默认部署上限为 16000 字符，由 `WBB_MESSAGE_MAX_CHARS` 控制；
-- HTTP schema 的绝对上限为 100000 字符；
-- 超过 4000 字符时，服务按自然边界拆成多个微信文字气泡。
-
-### 4.2 图片
-
-```json
-{
-  "type": "image",
-  "content_base64": "iVBORw0KGgoAAAANSUhEUgAA...",
-  "caption": "任务执行截图"
-}
-```
-
-约束：
-
-- `content_base64` 是标准 Base64 字符串；
-- 不得包含 `data:image/png;base64,` 等 data URL 前缀；
-- `caption` 可选，不能是空白，HTTP schema 最多 4000 字符，同时受
-  `WBB_MESSAGE_MAX_CHARS` 限制；
-- 解码后媒体默认上限为 20 MiB，由 `WBB_MEDIA_MAX_BYTES` 控制；
-- 解码后媒体的 HTTP schema 绝对上限为 25 MiB。
-
-### 4.3 普通文件
-
-```json
-{
-  "type": "file",
-  "content_base64": "JVBERi0xLjQKJ...",
-  "file_name": "report.pdf",
-  "caption": "任务报告"
-}
-```
-
-约束：
-
-- `content_base64` 规则与图片相同；
-- `file_name` 必填，最长 255 个字符；
-- `file_name` 只能是文件名，不能包含 `/`、`\` 或 NUL；
-- 图片扩展名必须使用 `type=image`；
-- 视频扩展名和视频发送不在外部契约中；
-- `caption` 可选，不能是空白，HTTP schema 最多 4000 字符，同时受
-  `WBB_MESSAGE_MAX_CHARS` 限制。
-
-### 4.4 开始输入
-
-```json
-{
-  "type": "typing_start"
-}
-```
-
-### 4.5 取消输入
-
-```json
-{
-  "type": "typing_cancel"
-}
-```
-
-输入状态只控制微信中的“正在输入”提示，不产生聊天气泡。调用方发送
-`typing_start` 后应在任务结束、取消或超时时发送 `typing_cancel`。
-
-## 5. 调用示例
-
-### 5.1 curl 发送文字
-
-```bash
-curl --fail-with-body \
-  -X POST "${WBB_BRIDGE_URL}/api/v1/messages" \
-  -H "Authorization: Bearer ${BRIDGE_API_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"type":"text","text":"自动化任务已完成"}'
-```
-
-### 5.2 PowerShell 发送文字
-
-```powershell
-$headers = @{
-    Authorization = "Bearer $env:BRIDGE_API_TOKEN"
-}
-$body = @{
-    type = "text"
-    text = "自动化任务已完成"
-} | ConvertTo-Json
-
-Invoke-RestMethod `
-    -Method Post `
-    -Uri "$env:WBB_BRIDGE_URL/api/v1/messages" `
-    -Headers $headers `
-    -ContentType "application/json" `
-    -Body $body
-```
-
-### 5.3 Python 通用客户端
-
-```python
-from __future__ import annotations
-
-import os
-from typing import Any
-
-import httpx
-
-BRIDGE_URL = os.environ["WBB_BRIDGE_URL"].rstrip("/")
-API_TOKEN = os.environ["BRIDGE_API_TOKEN"]
-
-
-def send_wechat(payload: dict[str, Any]) -> dict[str, Any]:
-    response = httpx.post(
-        f"{BRIDGE_URL}/api/v1/messages",
-        headers={"Authorization": f"Bearer {API_TOKEN}"},
-        json=payload,
-        timeout=90.0,
-    )
-    response.raise_for_status()
-    return response.json()
-
-
-result = send_wechat(
-    {
-        "type": "text",
-        "text": "数据同步任务已完成",
+  "servers": {
+    "wechatBridge": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp",
+      "headers": {"Authorization": "Bearer ${input:bridgeToken}"}
     }
-)
-print(result["id"], result["msg_id"])
-```
-
-### 5.4 Python 发送图片
-
-```python
-import base64
-from pathlib import Path
-
-image_base64 = base64.b64encode(Path("result.png").read_bytes()).decode("ascii")
-result = send_wechat(
-    {
-        "type": "image",
-        "content_base64": image_base64,
-        "caption": "任务结果",
-    }
-)
-```
-
-### 5.5 自动化任务完成 Hook
-
-```python
-from __future__ import annotations
-
-import traceback
-
-
-def run_task() -> None:
-    # 在这里执行真实任务。
-    ...
-
-
-try:
-    run_task()
-except Exception:
-    send_wechat(
-        {
-            "type": "text",
-            "text": "自动化任务失败\n" + traceback.format_exc(limit=3),
-        }
-    )
-    raise
-else:
-    send_wechat({"type": "text", "text": "自动化任务执行成功"})
-```
-
-不要把可能包含密码、访问令牌或个人数据的完整异常直接发送到微信。生产任务应
-先对错误信息脱敏，并限制消息长度。
-
-## 6. 成功响应
-
-文字、图片或文件的成功响应：
-
-```json
-{
-  "id": "9e4431a4-d3eb-449e-b027-1ba44f77884d",
-  "msg_id": "9223372036854000",
-  "type": "text",
-  "status": "sent",
-  "created_at": "2026-07-30T08:00:00.123456Z",
-  "sent_at": "2026-07-30T08:00:00.456789Z"
-}
-```
-
-| 字段 | 类型 | 含义 |
-| --- | --- | --- |
-| `id` | string | 服务内部生成的审计 ID |
-| `msg_id` | string 或 null | 微信为本次主消息分配的服务端 ID |
-| `type` | string | 本次请求的消息类型 |
-| `status` | `"sent"` | iLink 已同步接受本次动作 |
-| `created_at` | RFC 3339 时间 | 本地审计记录创建时间 |
-| `sent_at` | RFC 3339 时间 | 上游调用成功完成时间 |
-
-`typing_start` 和 `typing_cancel` 不产生微信聊天消息，因此 `msg_id` 为
-`null`。`200 sent` 表示微信 iLink 已接受动作，不表示接收端已经展示或已读。
-
-长文字拆成多个气泡时，响应中的 `msg_id` 对应第一段。图片或文件带
-`caption` 时，说明文字先单独发送，响应中的 `msg_id` 对应媒体主消息；如果
-说明已发送而媒体上传或投递失败，接口仍返回失败，因此媒体请求不是跨多条
-微信消息的原子事务。
-
-原始 `msg_id` 只在本次认证响应中返回。服务不提供外部消息查询接口，也不支持
-调用方使用该 ID 主动发送原生引用；需要审计时，调用方应自行保存成功响应。
-
-## 7. 错误处理
-
-### 7.1 稳定业务错误
-
-| HTTP | `detail.code` | 含义 | 建议处理 |
-| --- | --- | --- | --- |
-| 401 | `unauthorized` | Token 缺失、错误或已轮换 | 获取当前 Token，不重试原凭据 |
-| 409 | `owner_not_bound` | owner 尚未建立 | 让扫码账号先向 Bot 私聊 |
-| 409 | `interaction_required` | 会话上下文缺失或需要互动 | 让 owner 再向 Bot 发消息 |
-| 422 | `invalid_message` | 空白、超限或部署级校验失败 | 修正请求，不重试 |
-| 502 | `wechat_rejected` | 微信上游拒绝本次动作 | 检查互动状态和频率 |
-| 502 | `wechat_temporary_error` | 微信上游或网络暂时失败 | 谨慎人工或延迟重试 |
-| 503 | `wechat_not_ready` | 微信未登录或监听未就绪 | 完成登录并检查 ready |
-
-稳定业务错误格式：
-
-```json
-{
-  "detail": {
-    "code": "owner_not_bound",
-    "message": "The owner is not bound; send the bot a message first"
-  }
-}
-```
-
-客户端应依据 HTTP 状态和 `detail.code` 判断，不要匹配 `message` 文本。
-
-### 7.2 请求结构错误
-
-缺少字段、未知 `type`、多余字段、非法 Base64 或错误字段类型由 FastAPI
-返回 `422`，其 `detail` 是字段错误数组：
-
-```json
-{
-  "detail": [
-    {
-      "type": "missing",
-      "loc": ["body", "text"],
-      "msg": "Field required",
-      "input": {
-        "type": "text"
-      }
-    }
+  },
+  "inputs": [
+    {"id": "bridgeToken", "type": "promptString", "description": "微信桥接 MCP Token", "password": true}
   ]
 }
 ```
 
-调用方应把这类错误视为编程或配置错误，不应自动重试。
+桥接服务与管理页共用一个端口。跨主机使用 HTTPS 反向代理或受控私网。SDK 校验 Host 和浏览器
+Origin，允许本机回环地址和明确配置的 `WBB_HOST`。通过不同域名访问时，在 Bridge 配置
+`WBB_MCP_PUBLIC_ORIGIN=https://bridge.example.test` 并重启。填写实际协议、域名和非默认端口，
+客户端再在该地址后加 `/mcp`。令牌仅通过请求头传递，轮换后下一个请求就需要使用新值。
 
-## 8. 幂等、超时与重试
+客户端先执行 `initialize` 和 `notifications/initialized`，再通过 `tools/list` 发现工具并用
+`tools/call` 调用。服务使用无状态模式，返回 JSON，无需维护会话 ID。
+[Streamable HTTP 规范](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports) ·
+[VS Code MCP 配置](https://code.visualstudio.com/docs/agents/reference/mcp-configuration)
 
-接口把每次 POST 视为一条新的独立消息：
+## 工具参数
 
-- 请求体不接受 `idempotency_key`；
-- `Idempotency-Key` 请求头不参与去重；
-- 相同正文的两次 POST 会发送两条消息；
-- 服务端不会后台自动重试失败的出站动作。
+工具名为 `send_wechat_message`。`tools/list` 的 `inputSchema` 提供每个字段的说明、类型和必填项。工具的 `description` 列出当前部署实际接受的文字字符数和解码后媒体字节数。
 
-如果 iLink 已接受消息，但 HTTP 响应在到达调用方前断开，调用方看到的是
-“结果未知”。再次 POST 可能造成重复通知。建议：
+| 字段 | 何时填写 | 含义与取值 |
+| --- | --- | --- |
+| `message` | 始终必填 | 描述一个动作的 JSON 对象。目标固定为已绑定的扫码账号，只填写所选类型的字段。 |
+| `message.type` | 始终必填 | 区分大小写。`text` 发文字，`image` 发图片，`file` 发普通文件，`typing_start` 开始输入提示，`typing_cancel` 取消提示。后两种仅传 `type`。 |
+| `message.text` | `text` 必填 | 正文字符串，至少含一个非空白字符。文字上限由 `WBB_MESSAGE_MAX_CHARS` 决定，默认 16000，最高 100000 字符。超过 4000 字符时会分条发送。 |
+| `message.content_base64` | `image`、`file` 必填 | 原始文件字节的标准 Base64 字符串，不加换行或 `data:` URL 前缀。解码后至少 1 字节，上限由 `WBB_MEDIA_MAX_BYTES` 决定，默认 20 MiB，最高 25 MiB。 |
+| `message.file_name` | `file` 必填 | 微信显示的纯文件名，例如 `report.pdf`。最多 255 字符，不能只含空白，不能含 `/`、`\` 或 NUL。图片扩展名须改用 `image`，视频扩展名不支持。 |
+| `message.caption` | `image`、`file` 可选 | 说明文字。省略或传 `null` 时只发媒体。提供时须含非空白字符，最多 4000 字符，并受部署文字上限约束。说明会作为单独的文字消息先发送。 |
 
-1. 对业务事件在调用方记录“未发送、发送中、已成功、结果未知”；
-2. 收到 `200` 后保存 `id`、`msg_id` 和业务事件 ID 的对应关系；
-3. 对 `401`、`409`、`422` 不自动重试；
-4. 对明确的 `502` 使用有上限的指数退避，并先判断业务是否允许重复；
-5. 对 `503 wechat_not_ready` 等待 `/health/ready` 恢复后再决定是否发送；
-6. 对连接中断或客户端超时不要盲目重发，可转人工确认或发送带业务事件编号的
-   补充通知。
+**多行通知建议用 Markdown**。短标题、空行和列表能让接收人快速找到结果。桥接服务会保留换行及 Markdown 标记，按微信文本发送，不做富文本转换。单句通知也可以直接写纯文本。
 
-接口可能包含微信请求和媒体上传，客户端不应使用过短超时。示例使用 90 秒，
-调用方可根据文件大小和网络环境调整。
+以下示例都是完整工具参数。图片示例包含一张 1×1 像素的 PNG，实际调用时替换为自己的图片编码。
 
-## 9. 当前能力边界
+| 动作 | 参数示例 |
+| --- | --- |
+| 发送文字 | `{"message":{"type":"text","text":"## 构建完成\n- 版本：v1.2.0\n- 测试：通过"}}` |
+| 发送图片 | `{"message":{"type":"image","content_base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGMQbw0BAAGnAPEglmHsAAAAAElFTkSuQmCC","caption":"运行结果"}}` |
+| 发送文件 | `{"message":{"type":"file","content_base64":"SGVsbG8=","file_name":"report.txt","caption":"日报"}}` |
+| 开始输入 | `{"message":{"type":"typing_start"}}` |
+| 取消输入 | `{"message":{"type":"typing_cancel"}}` |
 
-- 目标固定为唯一 owner；
-- 不接受 `recipient`、`user_id`、联系人名称或 alias；
-- 不提供外部收件人列表、聊天列表、按 ID 查询或微信状态接口；
-- 不支持 Bot 主动发送原生引用；
-- 不支持原生语音或视频发送；
-- 图片和文件会整体 Base64 编码，请勿把本接口当作大文件传输通道；
-- iLink 主动发送可能受互动窗口和限频约束，`ret=-2` 不能单独确定具体原因。
+输入状态不会生成聊天气泡。任务结束、取消或超时时，调用 `typing_cancel` 收起提示。
+工具不接受 `recipient`、`user_id`、出站引用或幂等字段。原生语音和视频不在支持范围内。
 
-需要读取完整聊天、媒体或网关状态时使用受独立 Basic Auth 保护的 `/admin`。
-需要接收微信入站消息时在 `/admin` 配置单向消息转发，契约见
-[HTTP 接口：单向消息转发](api.md#7-单向消息转发)。
+## Python 示例
 
-## 10. 上线检查清单
+示例使用项目锁定的 MCP Python SDK。调用方从自己的环境变量 `BRIDGE_MCP_TOKEN` 读取
+管理页提供的 Token。运行 Bridge 的进程从 SQLite 读取该 Token。
 
-- [ ] 已从 `/admin` 复制当前公共 API Token，且未写入仓库；
-- [ ] Token 与管理密码、转发 HMAC Secret 互不相同；
-- [ ] 跨主机流量经过 HTTPS 或受控私网；
-- [ ] `/health/ready` 返回 200；
-- [ ] owner 已主动向 Bot 发消息并完成绑定；
-- [ ] 调用方能分别处理 401、409、422、502 和 503；
-- [ ] 调用方理解每次 POST 都是新消息；
-- [ ] 调用方保存成功响应并处理“结果未知”状态；
-- [ ] Hook 内容已脱敏并设置长度上限；
-- [ ] 图片和文件大小符合部署配置。
+```python
+import asyncio
+import json
+import os
+from datetime import timedelta
+
+import httpx
+from mcp import ClientSession
+from mcp.client.streamable_http import streamable_http_client
+
+
+async def main() -> None:
+    url = "http://127.0.0.1:8000/mcp"
+    headers = {"Authorization": f"Bearer {os.environ['BRIDGE_MCP_TOKEN']}"}
+    async with httpx.AsyncClient(headers=headers, timeout=90) as client:
+        async with streamable_http_client(url, http_client=client) as (read, write, _):
+            async with ClientSession(
+                read, write, read_timeout_seconds=timedelta(seconds=90)
+            ) as session:
+                await session.initialize()
+                result = await session.call_tool(
+                    "send_wechat_message",
+                    {"message": {"type": "text", "text": "## 同步完成\n- 数据表：3 张\n- 错误：0"}},
+                )
+                if result.isError:
+                    raise RuntimeError(json.loads(result.content[0].text)["code"])
+                print(result.structuredContent["id"], result.structuredContent["msg_id"])
+
+
+asyncio.run(main())
+```
+
+CI 或任务完成 Hook 可以在同一调用点发送文字消息。发送图片或文件时，用
+`base64.b64encode(path.read_bytes()).decode("ascii")` 填充 `content_base64`。
+
+## 结果与错误
+
+仅当 iLink 同步接受本次动作时，结果为 `isError: false`。成功对象位于 `structuredContent`，
+同时提供 JSON 文本形式的 `content[0].text` 供客户端读取。
+
+```json
+{
+  "id": "9e4431a4-d3eb-449e-b027-1ba44f77884d",
+  "msg_id": "123456789",
+  "type": "text",
+  "status": "sent",
+  "created_at": "2026-07-30T08:00:00Z",
+  "sent_at": "2026-07-30T08:00:01Z"
+}
+```
+
+`tools/list` 的 `outputSchema` 描述成功回执。调用方可按以下字段读取 `structuredContent`。
+
+| 字段 | 类型或取值 | 含义 |
+| --- | --- | --- |
+| `id` | UUID 字符串 | 本次发送的本地审计 ID。即使正文相同，两次发送仍有不同的 ID。 |
+| `msg_id` | 字符串或 `null` | 微信返回的主消息 ID。长文字对应第一段，带说明的媒体对应图片或文件本身。输入状态或上游未提供 ID 时为 `null`。 |
+| `type` | 与 `message.type` 相同 | 本次执行的动作，包括 `text`、`image`、`file`、`typing_start` 或 `typing_cancel`。 |
+| `status` | 固定为 `sent` | iLink 已接受动作，不能据此判断对方是否已读。 |
+| `created_at` | RFC 3339 UTC 时间字符串 | 桥接服务创建本次发送审计记录的时间。 |
+| `sent_at` | RFC 3339 UTC 时间字符串 | iLink 接受动作后，桥接服务记录成功的时间。 |
+
+握手和调用若缺少有效 Bearer，HTTP 层返回 401。参数和业务错误在 MCP 工具结果中标为
+`isError: true`，从 `content[0].text` 解析 JSON，例如
+`{"code":"owner_not_bound","message":"The owner is not bound; send the bot a message first"}`。
+
+| 工具错误码 | 调用方处理 |
+| --- | --- |
+| `unknown_tool` | 通过 `tools/list` 确认工具名为 `send_wechat_message` |
+| `invalid_message` | 修正参数、文件名、Base64 或部署限制后再发送 |
+| `owner_not_bound`、`interaction_required` | 让扫码账号向 Bot 私聊后再调用 |
+| `wechat_not_ready` | 登录管理页完成授权，查看 `/health/ready` |
+| `wechat_rejected`、`wechat_temporary_error` | 检查上游、互动窗口与限频，避免连续重发 |
+| `internal_error` | 检查 Bridge 运行状态和日志，核实投递结果 |
+
+每次工具调用都是独立发送。JSON-RPC 的请求 ID 只关联协议响应，不是幂等键。若请求已投递但
+响应超时，结果未知；请先核实微信或管理页历史，再决定是否重试。Bridge 不在后台自动重发。
+上游 `ret=-2` 可能与上下文过期或限频有关。

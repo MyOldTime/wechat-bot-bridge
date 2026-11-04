@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .paths import (
@@ -18,7 +18,7 @@ from .paths import (
 class Settings(BaseSettings):
     """经过校验的进程级运行配置。
 
-    公共 API Token 和消息转发参数由管理页面维护并持久化到服务配置表，
+    MCP Token 和消息转发参数由管理页面维护并持久化到服务配置表，
     不属于环境变量配置。
     """
 
@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     web_typing_timeout_seconds: int = Field(default=5, ge=1, le=30)
     host: str = "127.0.0.1"
     port: int = Field(default=8000, ge=1, le=65535)
+    mcp_public_origin: AnyHttpUrl | None = None
     log_level: str = "info"
 
     data_dir: Path = Field(default_factory=default_data_directory)
@@ -67,6 +68,20 @@ class Settings(BaseSettings):
             raise ValueError("WBB_WEB_PASSWORD must contain at least 12 characters")
         if secret == "replace-with-a-different-long-password":
             raise ValueError("WBB_WEB_PASSWORD must not use the example value")
+        return value
+
+    @field_validator("mcp_public_origin")
+    @classmethod
+    def validate_mcp_origin(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        if value and (
+            value.path not in {None, "/"}
+            or any(
+                part is not None
+                for part in (value.username, value.password, value.query, value.fragment)
+            )
+            or "*" in (value.host or "")
+        ):
+            raise ValueError("WBB_MCP_PUBLIC_ORIGIN must be an exact HTTP(S) origin")
         return value
 
     @field_validator("log_level")

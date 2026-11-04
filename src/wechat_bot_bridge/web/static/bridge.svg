@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="tile" x2=".85" y2="1" gradientUnits="objectBoundingBox">
+      <stop stop-color="#14665b"/>
+      <stop offset="1" stop-color="#102f3b"/>
+    </linearGradient>
+    <linearGradient id="bubble" x2=".6" y2="1">
+      <stop stop-color="#eeffec"/>
+      <stop offset="1" stop-color="#7fefad"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1" width="62" height="62" rx="15" fill="url(#tile)"/>
+  <path fill="url(#bubble)" d="M24 12h17a13 13 0 0 1 13 13v10a13 13 0 0 1-13 13H27l-12 8v-9a13 13 0 0 1-5-10V26a14 14 0 0 1 14-14Z"/>
+  <path fill="#14564f" d="M17 28h4v-4h5v4h12v-4h5v4h4v5h-4v6h-5v-2a6 6 0 0 0-12 0v2h-5v-6h-4Z"/>
+</svg>

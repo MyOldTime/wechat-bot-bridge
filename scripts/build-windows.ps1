@@ -1,5 +1,5 @@
-[CmdletBinding()]
-param()
+﻿[CmdletBinding()]
+param([string]$DistRoot)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -12,7 +12,8 @@ if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$distRoot = Join-Path $projectRoot 'dist'
+if (-not $DistRoot) { $DistRoot = Join-Path $projectRoot 'dist' }
+$distRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DistRoot)
 $outputDir = Join-Path $distRoot 'wechat-bot-bridge-windows-x64'
 $zipPath = Join-Path $distRoot 'wechat-bot-bridge-windows-x64.zip'
 $workRoot = Join-Path $projectRoot 'build\pyinstaller'
@@ -23,15 +24,15 @@ $previousUvEnvironment = [Environment]::GetEnvironmentVariable('UV_PROJECT_ENVIR
 New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 $allowedFiles = @(
     'wechat-bot-bridge.exe',
-    'windows.env.example',
     'README-WINDOWS.txt',
     'LICENSE',
     'SHA256SUMS.txt'
 )
-$unexpectedFiles = @(Get-ChildItem -LiteralPath $outputDir -Force | Where-Object { $_.Name -notin $allowedFiles })
+# 旧版公开模板可留在原目录，ZIP 只收集本版发布文件。
+$unexpectedFiles = @(Get-ChildItem -LiteralPath $outputDir -Force | Where-Object { $_.Name -notin $allowedFiles -and $_.Name -ne 'windows.env.example' })
 if ($unexpectedFiles.Count -gt 0) {
     $names = ($unexpectedFiles | ForEach-Object Name) -join ', '
-    throw "发布目录包含未知文件，请人工确认后处理：$names"
+    throw "发布目录包含其他文件 ($names)，请使用 -DistRoot 指定单独的构建输出目录。"
 }
 
 try {
@@ -70,13 +71,13 @@ if (-not (Test-Path -LiteralPath $packagedExe -PathType Leaf)) {
     throw "未找到发布 EXE：$packagedExe"
 }
 
-Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\windows.env.example') -Destination (Join-Path $outputDir 'windows.env.example') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'packaging\README-WINDOWS.txt') -Destination (Join-Path $outputDir 'README-WINDOWS.txt') -Force
 Copy-Item -LiteralPath (Join-Path $projectRoot 'LICENSE') -Destination (Join-Path $outputDir 'LICENSE') -Force
 
 $hash = (Get-FileHash -LiteralPath $packagedExe -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content -LiteralPath (Join-Path $outputDir 'SHA256SUMS.txt') -Encoding ascii -NoNewline -Value "$hash  wechat-bot-bridge.exe`n"
-Compress-Archive -Path (Join-Path $outputDir '*') -DestinationPath $zipPath -CompressionLevel Optimal -Force
+$packageFiles = @($allowedFiles | ForEach-Object { Join-Path $outputDir $_ })
+Compress-Archive -LiteralPath $packageFiles -DestinationPath $zipPath -CompressionLevel Optimal -Force
 
 Write-Host "Windows 发布目录：$outputDir"
 Write-Host "单文件 EXE：$packagedExe"

@@ -10,9 +10,11 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
+from starlette.routing import Route
 
-from ..api.external import build_external_router
+from ..api.external import build_mcp_manager
 from ..api.health import build_health_router
+from ..api.security import AuthenticatedMCP
 from ..application.account import AccountLifecycleService
 from ..application.configuration import (
     OutboundForwardingConfigurationService,
@@ -118,9 +120,12 @@ def create_app(
 
         gateway_task = asyncio.create_task(gateway.run(), name="wechat-listener")
         app.state.gateway_task = gateway_task
-        logger.info("微信桥接服务启动完成")
         try:
-            yield
+            manager = build_mcp_manager(service, resolved_settings)
+            app.state.mcp_manager = manager
+            async with manager.run():
+                logger.info("微信桥接服务启动完成")
+                yield
         finally:
             logger.info("正在停止微信桥接服务")
             await typing_lease.close()
@@ -141,7 +146,8 @@ def create_app(
     app = FastAPI(
         title="wechat-bot-bridge",
         version="0.1.0",
-        description="Synchronous HTTP bridge for WeChat iLink Bot notifications",
+        description="MCP bridge for WeChat iLink Bot notifications",
+        routes=[Route("/mcp", AuthenticatedMCP())],
         lifespan=lifespan,
     )
     app.state.settings = resolved_settings
@@ -155,6 +161,5 @@ def create_app(
         name="admin-static",
     )
     app.include_router(build_health_router())
-    app.include_router(build_external_router())
     app.include_router(build_web_router())
     return app

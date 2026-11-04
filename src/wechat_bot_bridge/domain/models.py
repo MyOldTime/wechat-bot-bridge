@@ -29,6 +29,7 @@ class OutboundMessageType(StrEnum):
 
 
 class MessageOrigin(StrEnum):
+    MCP = "mcp"
     EXTERNAL_API = "external_api"
     WEB_ADMIN = "web_admin"
     WECHAT = "wechat"
@@ -249,7 +250,7 @@ class ForwardingScheme(StrEnum):
 
 
 class PublicApiTokenSnapshot(BaseModel):
-    """管理页面可读取的当前公共 API Token 快照。"""
+    """管理页面可读取的当前 MCP Token 快照。"""
 
     model_config = ConfigDict(frozen=True)
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Final
 
 _CONTEXT_FIELDS: Final[tuple[str, ...]] = (
@@ -52,7 +54,15 @@ class SafeContextFormatter(logging.Formatter):
         return f"{rendered} context={serialized}"
 
 
-def configure_logging(level: str) -> None:
+def _safe_log_source(record: logging.LogRecord) -> bool:
+    if record.name.startswith("wechat_bot_bridge."):
+        return True
+    if record.name == "uvicorn.access" and isinstance(record.args, tuple):
+        return len(record.args) == 5 and "?" not in str(record.args[2])
+    return record.name == "uvicorn.error" and record.levelno >= logging.INFO
+
+
+def configure_logging(level: str, *, log_file: Path | None = None) -> None:
     """为 CLI 进程安装统一日志处理器。
 
     Uvicorn 使用同一个根处理器，应用日志和访问日志因而具有一致的时间、
@@ -68,8 +78,14 @@ def configure_logging(level: str) -> None:
             logging.INFO,
         )
     )
-    handler = logging.StreamHandler()
+    handler: logging.Handler = (
+        RotatingFileHandler(log_file, maxBytes=1024 * 1024, backupCount=2, encoding="utf-8")
+        if log_file is not None
+        else logging.StreamHandler()
+    )
     handler.setFormatter(SafeContextFormatter(_LOG_FORMAT))
+    # SDK 也用根 logger 输出校验输入，SQLite 调试日志包含绑定参数。
+    handler.addFilter(_safe_log_source)
 
     root_logger = logging.getLogger()
     root_logger.handlers.clear()
@@ -79,6 +95,10 @@ def configure_logging(level: str) -> None:
     # HTTP 客户端逐请求调试信息噪声较大；协议错误由本项目在更高层统一记录。
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # MCP SDK 的调试消息和 Uvicorn 的 ASGI 跟踪可包含完整请求与认证头。
+    logging.getLogger("mcp").setLevel(logging.CRITICAL + 1)
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.asgi").disabled = True
     logging.captureWarnings(True)
 
 

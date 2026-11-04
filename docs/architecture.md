@@ -4,7 +4,7 @@
 
 `wechat-bot-bridge` 把微信 iLink Bot 封装为单机桥接服务：
 
-- 自动化任务只依赖一个 Bearer 认证的发送接口；
+- 自动化任务只依赖一个 Bearer 认证的 MCP 工具；
 - 管理员通过独立 Basic Auth 页面查看和发送完整聊天；
 - 单一长轮询消费者接收入站消息；
 - SQLite 是聊天历史和会话上下文的恢复依据；
@@ -16,7 +16,7 @@
 
 ```text
 src/wechat_bot_bridge/
-├── api/                        外部 POST、Bearer、健康检查、HTTP schema
+├── api/                        MCP 工具、Bearer、健康检查、共享载荷 schema
 ├── application/                账号生命周期、发送编排、服务配置、载荷校验、输入租约
 ├── bootstrap/                  FastAPI/CLI 装配、单实例锁与生命周期
 ├── core/                       WBB_* 配置、源码/冻结程序路径策略
@@ -65,7 +65,7 @@ api/web/bootstrap -> application -> domain ports <- infrastructure adapters
 
 ```mermaid
 flowchart LR
-    EXT["自动化任务 / Hook"] -->|"Bearer<br/>POST /api/v1/messages"| API["外部 API"]
+    EXT["自动化任务 / MCP 客户端"] -->|"Bearer<br/>Streamable HTTP /mcp"| API["send_wechat_message"]
     ADMIN["管理员浏览器"] -->|"Basic Auth"| WEB["Jinja2 页面 + 管理接口"]
     ADMIN <-->|"短期令牌 + WebSocket"| HUB["ConversationHub"]
     API --> APP["NotificationService"]
@@ -145,19 +145,19 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant C as 自动化调用方
-    participant A as 外部 API
+    participant A as MCP 工具
     participant S as NotificationService
     participant D as SQLite
     participant H as ConversationHub
     participant W as iLink 适配器
 
-    C->>A: POST /api/v1/messages
+    C->>A: tools/call send_wechat_message
     Note over C,A: Bearer + type 判别联合
-    A->>S: 领域载荷 + external_api
+    A->>S: 领域载荷 + mcp
     S->>D: 解析当前会话的唯一 owner
     alt owner / 会话不可用
         S-->>A: 稳定业务错误
-        A-->>C: 409 / 503
+        A-->>C: isError + 业务错误码
     else 可发送
         S->>D: 写 outbox 与 chat_messages(sending)
         S->>H: message_upsert(sending)
@@ -165,25 +165,26 @@ sequenceDiagram
         alt iLink 接受
             S->>D: sent + sent_at
             S->>H: message_upsert(sent)
-            A-->>C: 200
+            A-->>C: structuredContent + sent
         else 上游失败
             S->>D: failed + error_code
             S->>H: message_upsert(failed)
-            A-->>C: 502 / 503
+            A-->>C: isError + 业务错误码
         end
     end
 ```
 
 应用服务使用异步锁串行化唯一账号的出站动作，避免媒体上传和消息项交叉；同一把锁也覆盖账号退出与清理。服务不做后台出站重试。
 
-每个 POST 都生成新的 UUID。文字、图片和文件同步成功响应还会返回微信
+每次独立发送都生成新的 UUID。文字、图片和文件同步成功响应还会返回微信
 `sendmessage.message_id`，外部字段名为 `msg_id`；原始值不持久化，SQLite
-只保存账号隔离哈希。输入状态没有微信聊天消息，因此 `msg_id=null`。外部
-`Idempotency-Key` 被忽略，网络在 iLink 接受后、HTTP 响应前断开时存在提交
-歧义；重试可能重复通知。
+只保存账号隔离哈希。输入状态没有微信聊天消息，因此 `msg_id=null`。JSON-RPC ID
+只关联协议响应。若响应丢失，再次调用工具可能重复通知。
 
-外部 OpenAPI 只包含这个 POST。消息列表、单 ID 查询、收件人和微信状态属于
-管理端能力，完整内容只能通过管理端的独立认证读取。
+FastAPI lifespan 启停官方 SDK 的无状态 Streamable HTTP 会话管理器。请求进入协议层前，
+先用服务配置中的 Token 鉴权。SDK 校验 Host、Origin 和请求体大小。外部调用方先通过
+`tools/list` 获取工具 schema，再用 `tools/call` 提交带判别字段的 `message`。完整聊天
+记录和微信状态由管理页单独鉴权，`/openapi.json` 的 `paths` 为空。
 
 ### 出站类型
 
@@ -192,7 +193,7 @@ sequenceDiagram
 - `file` -> `getuploadurl`、AES/CDN 上传、可选说明文字、文件 `sendmessage`；
 - `typing_start` / `typing_cancel` -> `getconfig` 取得 ticket 后调用 `sendtyping`。
 
-媒体经标准 Base64 解码，默认上限 20 MiB、绝对上限 25 MiB。公共 API 和
+媒体经标准 Base64 解码，默认上限 20 MiB、绝对上限 25 MiB。MCP 工具和
 管理页面不开放原生语音、视频或 Bot 出站引用；`ref_msg` 只进入微信入站
 解析链路。
 
@@ -255,9 +256,10 @@ sequenceDiagram
 - 退出使用 Basic Auth 下的原生 URL 编码表单，并校验隐藏的短期页面令牌；成功清除后重定向回登录视图。
 - 输入框键入使用 `TypingLeaseService`；浏览器刷新防抖定时器，服务端租约到期后兜底取消微信输入状态。
 - 微信入站原生引用以只读快照展示；引用 item ID 精确匹配到已保存历史的顶层 message ID 或 item ID 时，引用框可点击定位原文并让目标气泡闪高两次。页面不提供右键引用或 Bot 出站引用。
-- 左侧服务配置菜单通过 `configuration.py` 管理自动生成的公共 API Token 和单向转发参数；读取 Secret 的响应使用 `no-store`，写操作复用现有短期页面令牌，登录后不重复询问密码。
+- 左侧服务配置菜单通过 `configuration.py` 管理自动生成的MCP Token 和单向转发参数；读取 Secret 的响应使用 `no-store`，写操作复用现有短期页面令牌，登录后不重复询问密码。
 
-Basic 密码与外部 Bearer Token 不得复用。没有 `WBB_WEB_PASSWORD` 时整个管理端关闭。HTML 使用 `no-store`、严格 CSP 和禁止 framing；媒体启用 `nosniff` 与沙箱 CSP。
+Basic 密码与外部 Bearer Token 不得复用。源码和 Docker 部署缺少 `WBB_WEB_PASSWORD` 时管理端关闭。
+Windows 首次启动会在用户配置中生成随机管理密码。HTML 使用 `no-store`、严格 CSP 和禁止 framing；媒体启用 `nosniff` 与沙箱 CSP。
 
 页面先建立 WebSocket，再在网关进入 `listening` 后加载 SQLite 历史并按 ID upsert，可覆盖“订阅与初次加载之间”的竞态。断线后自动重连；进程总线对慢订阅者丢弃最旧事件，因此历史接口始终是恢复依据。收到 `account_reset` 后页面立即清空内存消息、附件、原生引用快照和游标，并切换到扫码视图。
 
@@ -278,8 +280,10 @@ Windows 单文件 EXE 的默认持久化布局：
 
 ```text
 %LOCALAPPDATA%\wechat-bot-bridge\
+├── config\settings.json
 ├── wechat-bridge.db
 ├── wechat-bot-bridge.lock
+├── wechat-bot-bridge.log
 └── wechat\
     └── credentials.json
 ```
@@ -294,7 +298,7 @@ Windows 单文件 EXE 的默认持久化布局：
 - `inbound_events`：入站事件去重；
 - `outbound_messages`：同步出站审计；
 - `chat_messages`：管理页面完整会话内容、媒体、方向、来源、状态，以及微信原生引用快照。
-- `service_settings`：公共 API Token 和单向转发配置；不属于微信账号业务数据。
+- `service_settings`：MCP Token 和单向转发配置；不属于微信账号业务数据。
 
 文字直接保存在 `chat_messages.text`。页面发送以及内置客户端下载成功的微信入站图片和文件保存在 BLOB，并通过 Basic 保护的媒体接口读取；图片以内容签名判断安全 MIME，未知内容使用 `application/octet-stream`，SVG 等未识别内容不会作为可内嵌图片提供。微信入站消息的官方 `MessageItem.msg_id` 和顶层 `WeixinMessage.message_id` 分别与账号 ID 一起哈希后保存在内部 `protocol_item_id`、`protocol_message_id`，不落原始值。Bot 出站主项固定使用本地消息 UUID 作为顶层 `client_id`，传输层解析线上 `sendmessage` 成功响应的整数 `message_id`；该值与微信引用中的 `MessageItem.msg_id` 相同，成功投递后按同样规则哈希写入对应出站记录。引用保存 `native_quote_title/type/text`、内部 `native_quote_protocol_item_id` 和精确目标；SQLite 用引用键匹配原消息的任一协议键并回填上游缺失的正文，不使用正文或时间猜测。
 
@@ -307,7 +311,7 @@ Windows 单文件 EXE 的默认持久化布局：
 ## 9. 生命周期与并发
 
 - 单进程、一个 Uvicorn worker、一个 iLink 长轮询所有者。
-- CLI 在打开 SQLite 前持有数据目录文件锁；第二个进程立即失败，不依赖端口冲突作为并发保护。
+- CLI 和 Windows 托盘入口在打开 SQLite 前持有数据目录文件锁；第二个进程立即失败，不依赖端口冲突作为并发保护。
 - FastAPI lifespan 依次管理 SQLite、Dispatcher、Gateway task，并在关闭时停止和等待。
 - 无凭据时 Gateway task 常驻等待管理端登录事件；有有效凭据时直接启动监听。
 - 管理端输入租约任务也属于 lifespan；关闭前尽力取消仍处于活动状态的微信输入提示。
@@ -321,7 +325,7 @@ Windows 单文件 EXE 的默认持久化布局：
 
 信任边界：
 
-1. 外部任务 -> `/api/v1/messages`：管理页面生成的 Bearer Token；
+1. MCP 客户端 -> `/mcp`：管理页面生成的 Bearer Token；
 2. 管理浏览器 -> `/admin`：独立 Basic Auth；
 3. 已认证页面 -> 写操作、退出表单/WebSocket：短期 HMAC 页面令牌；
 4. 服务 -> iLink：宿主机映射的明文授权文件；
@@ -361,20 +365,25 @@ iLink wire 构造、SQLite、页面呈现、测试和文档。当前 iLink 渠�
 
 ## 12. 冻结发布边界
 
-Windows 发布使用 PyInstaller one-file，入口为 `packaging/windows_entry.py`。无参数启动只在
-冻结入口映射为现有 `serve`，Python 模块和项目 CLI 不增加第二个业务子命令。spec 明确收集：
+Windows 发布使用 PyInstaller one-file 的 GUI 子系统。双击 `packaging/windows_entry.py` 对应的
+EXE 会取得部署锁，主线程运行 Win32 托盘消息循环，服务线程运行唯一的 Uvicorn。托盘退出
+请求设置 `server.should_exit`，等待 lifespan 排空并关闭数据库后再释放锁。Explorer 重启时
+会重新注册图标。桌面日志轮换写入数据目录。spec 明确收集：
 
 - `wechat_bot_bridge/web/templates` 与 `web/static`；
+- 多尺寸 `packaging/bridge.ico` 作为 EXE 图标资源，托盘直接加载同一资源中的小图标；
 - 项目 dist-info，保证 `importlib.metadata.version()` 可用；
 - Uvicorn 动态选择的 HTTP、WebSocket、事件循环和 lifespan 子模块；
 - Python 解释器、Cryptography、SQLite 与其他锁定依赖。
 
-PyInstaller 解包目录只保存本次进程的只读代码和动态库。冻结程序通过 `sys.executable` 找到
-用户实际启动的 EXE，并只从该目录读取 `.env`；默认可写数据由平台数据目录解析器放到
-`%LOCALAPPDATA%\wechat-bot-bridge`。模板仍按包内 `__file__` 定位，因此源码、wheel、Docker
-和 one-file 共用同一套页面加载逻辑。发布包不得包含 `.env`、数据库、微信授权、聊天正文或
-真实 Token。
+PyInstaller 解包目录只保存只读代码和动态库。源码开发从工作目录读取 `.env`，Compose 从宿主机
+注入环境变量。Windows 桌面入口只从 `%LOCALAPPDATA%\wechat-bot-bridge\config\settings.json`
+加载 `WBB_*` 应用配置并复用同一套校验。文件缺失时生成随机管理密码，先写完整的临时文件，
+再原子发布。并发启动采用先成功写入的配置。已有文件无效时报告错误，保留其内容。
+默认可写数据仍位于 `%LOCALAPPDATA%\wechat-bot-bridge`，自定义数据位置不改变配置文件位置。
+模板按包内 `__file__` 定位。发布包不得包含用户配置、`.env`、数据库、微信授权、聊天正文或真实 Token。
 
 Windows EXE 必须在 Windows 上构建。`scripts/build-windows.ps1` 使用独立 uv 环境执行全部质量
 门禁和 PyInstaller；`scripts/test-windows-release.ps1` 以临时数据目录启动真实单文件 EXE，
-验证默认 `serve`、外部 OpenAPI、Basic 管理页面、静态资源、SQLite 路径与单实例锁。
+验证无参数 GUI 启动、Windows 通知区注册、托盘退出、MCP 握手与工具调用、OpenAPI、
+Basic 管理页面、静态资源、SQLite 路径与单实例锁。

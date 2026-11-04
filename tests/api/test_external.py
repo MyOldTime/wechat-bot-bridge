@@ -1,9 +1,10 @@
-"""外部 FastAPI 契约测试，生命周期受控且不访问微信网络。"""
+"""外部 MCP 契约测试，生命周期受控且不访问微信网络。"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,6 +14,8 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
+from mcp import ClientSession, types
+from mcp.client.streamable_http import streamable_http_client
 
 from wechat_bot_bridge.bootstrap.app import create_app
 from wechat_bot_bridge.core.config import Settings
@@ -115,7 +118,7 @@ async def _running_client(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
             transport=transport,
-            base_url="http://testserver",
+            base_url="http://127.0.0.1",
         ) as client:
             yield client, app, gateway
     assert gateway.stop_called is True
@@ -140,24 +143,90 @@ async def _authorization(app: FastAPI) -> dict[str, str]:
     return {"Authorization": f"Bearer {snapshot.token}"}
 
 
-def test_openapi_exposes_only_the_single_external_message_endpoint(
-    tmp_path: Path,
-) -> None:
-    schema = create_app(_settings(tmp_path)).openapi()
+@asynccontextmanager
+async def _session(client: httpx.AsyncClient, app: FastAPI) -> AsyncIterator[ClientSession]:
+    client.headers.update(await _authorization(app))
+    async with streamable_http_client("http://127.0.0.1/mcp", http_client=client) as (
+        read,
+        write,
+        _,
+    ):
+        async with ClientSession(read, write) as session:
+            result = await session.initialize()
+            assert result.serverInfo.name == "wechat-bot-bridge"
+            yield session
 
-    assert set(schema["paths"]) == {"/api/v1/messages"}
-    assert set(schema["paths"]["/api/v1/messages"]) == {"post"}
-    request_schema = schema["paths"]["/api/v1/messages"]["post"]["requestBody"]["content"][
-        "application/json"
-    ]["schema"]
-    assert request_schema["discriminator"]["propertyName"] == "type"
-    assert set(request_schema["discriminator"]["mapping"]) == {
-        "text",
-        "image",
-        "file",
-        "typing_start",
-        "typing_cancel",
-    }
+
+async def _send(session: ClientSession, message: dict[str, Any]) -> types.CallToolResult:
+    return await session.call_tool("send_wechat_message", {"message": message})
+
+
+def _error_code(result: types.CallToolResult) -> str:
+    assert result.isError
+    block = result.content[0]
+    assert isinstance(block, types.TextContent)
+    return json.loads(block.text)["code"]
+
+
+async def test_mcp_discovery_only_exposes_the_send_tool(tmp_path: Path) -> None:
+    async with (
+        _running_client(tmp_path) as (client, app, _gateway),
+        _session(client, app) as session,
+    ):
+        assert app.openapi()["paths"] == {}
+        tools = (await session.list_tools()).tools
+        assert [tool.name for tool in tools] == ["send_wechat_message"]
+        schema = tools[0].inputSchema
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        message_ref = schema["properties"]["message"]["$ref"].rsplit("/", 1)[1]
+        discriminator = schema["$defs"][message_ref]["discriminator"]
+        assert discriminator["propertyName"] == "type"
+        assert set(discriminator["mapping"]) == {
+            "text",
+            "image",
+            "file",
+            "typing_start",
+            "typing_cancel",
+        }
+        assert _error_code(await session.call_tool("list_contacts", {})) == "unknown_tool"
+
+
+async def test_discovered_fields_explain_variants_limits_and_markdown(tmp_path: Path) -> None:
+    async with (
+        _running_client(tmp_path, message_max_chars=300, media_max_bytes=8192) as (
+            client,
+            app,
+            gateway,
+        ),
+        _session(client, app) as session,
+    ):
+        (tool,) = (await session.list_tools()).tools
+        assert tool.description is not None
+        assert "300 字符" in tool.description
+        assert "8192 字节" in tool.description
+        schema = tool.inputSchema
+        message = schema["properties"]["message"]
+        assert message["description"]
+        variants = schema["$defs"][message["$ref"].rsplit("/", 1)[1]]["discriminator"]["mapping"]
+        for kind, ref in variants.items():
+            fields = schema["$defs"][ref.rsplit("/", 1)[1]]["properties"]
+            assert fields["type"]["const"] == kind
+            assert all(field.get("description") for field in fields.values()), kind
+
+        assert tool.outputSchema is not None
+        output = tool.outputSchema["properties"]
+        assert set(output) == {"id", "msg_id", "type", "status", "created_at", "sent_at"}
+        assert all(field.get("description") for field in output.values())
+
+        text = schema["$defs"][variants["text"].rsplit("/", 1)[1]]["properties"]["text"]
+        assert "Markdown" in text["description"]
+        example = text["examples"][0]
+        assert "\n- " in example
+        await _seed_owner(app)
+        result = await _send(session, {"type": "text", "text": example})
+        assert not result.isError
+        assert gateway.sent[0][2] == TextPayload(text=example)
 
 
 async def test_health_endpoints_are_public_and_hidden_from_openapi(
@@ -188,18 +257,18 @@ async def test_external_endpoint_requires_bearer_auth_with_constant_time_compare
         "wechat_bot_bridge.application.configuration.secrets.compare_digest",
         recording_compare_digest,
     )
-    body = {"type": "text", "text": "task complete"}
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
     async with _running_client(tmp_path) as (client, app, _gateway):
         authorization = await _authorization(app)
         expected_token = (await app.state.public_api_credentials.current()).token
-        missing = await client.post("/api/v1/messages", json=body)
+        missing = await client.post("/mcp", json=body)
         wrong = await client.post(
-            "/api/v1/messages",
+            "/mcp",
             headers={"Authorization": "Bearer definitely-wrong"},
             json=body,
         )
-        await _seed_owner(app)
-        correct = await client.post("/api/v1/messages", headers=authorization, json=body)
+        authorization["Accept"] = "application/json, text/event-stream"
+        correct = await client.post("/mcp", headers=authorization, json=body)
 
         assert missing.status_code == 401
         assert missing.headers["www-authenticate"] == "Bearer"
@@ -213,41 +282,24 @@ async def test_external_endpoint_requires_bearer_auth_with_constant_time_compare
         ]
 
 
-async def test_each_external_post_is_a_distinct_synchronous_message(
-    tmp_path: Path,
-) -> None:
-    async with _running_client(tmp_path) as (client, app, gateway):
+async def test_each_call_is_a_distinct_synchronous_message(tmp_path: Path) -> None:
+    async with (
+        _running_client(tmp_path) as (client, app, gateway),
+        _session(client, app) as session,
+    ):
         await _seed_owner(app)
-        authorization = await _authorization(app)
         request = {"type": "text", "text": "task complete"}
-        # 请求头不参与幂等处理；每次 POST 都代表一条新消息。
-        headers = {**authorization, "Idempotency-Key": "legacy-task-1"}
-
-        first = await client.post("/api/v1/messages", headers=headers, json=request)
-        repeated = await client.post("/api/v1/messages", headers=headers, json=request)
-
-        assert first.status_code == 200
-        assert repeated.status_code == 200
-        assert first.json()["status"] == "sent"
-        assert first.json()["type"] == "text"
-        assert first.json()["msg_id"] == "server-message-1"
-        assert repeated.json()["msg_id"] == "server-message-2"
-        assert first.json()["id"] != repeated.json()["id"]
-        assert "location" not in first.headers
-        assert gateway.sent == [
-            (
-                first.json()["id"],
-                "user-1",
-                TextPayload(text="task complete"),
-                "private-context",
-            ),
-            (
-                repeated.json()["id"],
-                "user-1",
-                TextPayload(text="task complete"),
-                "private-context",
-            ),
-        ]
+        first, second = await asyncio.gather(_send(session, request), _send(session, request))
+        assert not first.isError and not second.isError
+        results = [first.structuredContent, second.structuredContent]
+        assert all(result and result["status"] == "sent" for result in results)
+        assert {result["msg_id"] for result in results} == {"server-message-1", "server-message-2"}
+        assert {result["id"] for result in results} == {call[0] for call in gateway.sent}
+        assert results[0]["id"] != results[1]["id"]
+        assert all(
+            call[1:] == ("user-1", TextPayload(text="task complete"), "private-context")
+            for call in gateway.sent
+        )
 
 
 async def test_external_endpoint_supports_public_sdk_message_types(
@@ -273,19 +325,18 @@ async def test_external_endpoint_supports_public_sdk_message_types(
         ({"type": "typing_cancel"}, "typing_cancel"),
     ]
 
-    async with _running_client(tmp_path) as (client, app, gateway):
+    async with (
+        _running_client(tmp_path) as (client, app, gateway),
+        _session(client, app) as session,
+    ):
         await _seed_owner(app)
-        authorization = await _authorization(app)
-        responses = [
-            await client.post("/api/v1/messages", headers=authorization, json=body)
-            for body, _expected_type in requests
-        ]
+        responses = [await _send(session, body) for body, _expected_type in requests]
 
-        assert [response.status_code for response in responses] == [200] * 5
-        assert [response.json()["type"] for response in responses] == [
+        assert not any(response.isError for response in responses)
+        assert [response.structuredContent["type"] for response in responses] == [
             expected_type for _body, expected_type in requests
         ]
-        assert [response.json()["msg_id"] for response in responses] == [
+        assert [response.structuredContent["msg_id"] for response in responses] == [
             "server-message-1",
             "server-message-2",
             "server-message-3",
@@ -302,9 +353,11 @@ async def test_external_endpoint_supports_public_sdk_message_types(
 
 
 async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> None:
-    async with _running_client(tmp_path) as (client, app, gateway):
+    async with (
+        _running_client(tmp_path) as (client, app, gateway),
+        _session(client, app) as session,
+    ):
         await _seed_owner(app)
-        authorization = await _authorization(app)
         bodies = [
             {
                 "type": "voice",
@@ -319,6 +372,7 @@ async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> 
                 "file_name": "photo.png",
             },
             {"text": "legacy payload"},
+            {"type": "text", "text": "test", "user_id": "another-owner"},
             {
                 "type": "text",
                 "text": "legacy payload",
@@ -335,66 +389,90 @@ async def test_invalid_and_unsupported_payloads_are_rejected(tmp_path: Path) -> 
                 "quote_msg_id": "wechat-server-message-id",
             },
         ]
-        responses = [
-            await client.post("/api/v1/messages", headers=authorization, json=body)
-            for body in bodies
-        ]
-        assert [response.status_code for response in responses] == [422] * len(bodies)
+        responses = [await _send(session, body) for body in bodies]
+        assert all(_error_code(response) == "invalid_message" for response in responses)
+        assert "private-chat-message" not in str(responses)
         assert gateway.sent == []
 
 
+async def test_mcp_accepts_media_larger_than_the_sdk_default_limit(tmp_path: Path) -> None:
+    # 3 MiB 的媒体编码后仅信封就会使请求突破 SDK 默认的 4 MiB 上限。
+    data = b"x" * (3 * 1024 * 1024)
+    async with (
+        _running_client(tmp_path) as (client, app, gateway),
+        _session(client, app) as session,
+    ):
+        await _seed_owner(app)
+        result = await _send(
+            session, {"type": "image", "content_base64": base64.b64encode(data).decode("ascii")}
+        )
+        assert not result.isError
+        assert gateway.sent[0][2] == ImagePayload(data=data)
+
+
 async def test_external_endpoint_maps_application_errors(tmp_path: Path) -> None:
-    async with _running_client(tmp_path, message_max_chars=5) as (client, app, gateway):
-        authorization = await _authorization(app)
-        blank_message = await client.post(
-            "/api/v1/messages",
-            headers=authorization,
-            json={"type": "text", "text": "   "},
-        )
+    async with (
+        _running_client(tmp_path, message_max_chars=5, media_max_bytes=1) as (client, app, gateway),
+        _session(client, app) as session,
+    ):
+
+        async def send_text(text: str) -> types.CallToolResult:
+            return await _send(session, {"type": "text", "text": text})
+
+        assert _error_code(await send_text("   ")) == "invalid_message"
         gateway._session_fingerprint = None
-        no_session = await client.post(
-            "/api/v1/messages",
-            headers=authorization,
-            json={"type": "text", "text": "hello"},
-        )
+        assert _error_code(await send_text("hello")) == "wechat_not_ready"
         gateway._session_fingerprint = SESSION
         await app.state.store.activate_session(SESSION)
-        unbound = await client.post(
-            "/api/v1/messages",
-            headers=authorization,
-            json={"type": "text", "text": "hello"},
-        )
+        assert _error_code(await send_text("hello")) == "owner_not_bound"
         await _seed_owner(app, context_token="")
-        missing_context = await client.post(
-            "/api/v1/messages",
-            headers=authorization,
-            json={"type": "text", "text": "hello"},
-        )
+        assert _error_code(await send_text("hello")) == "interaction_required"
         await _seed_owner(app)
-        too_long = await client.post(
-            "/api/v1/messages",
-            headers=authorization,
-            json={"type": "text", "text": "123456"},
+        assert _error_code(await send_text("123456")) == "invalid_message"
+        assert (
+            _error_code(await _send(session, {"type": "image", "content_base64": "YWI="}))
+            == "invalid_message"
         )
         gateway.outcomes.append(GatewayTemporaryError("temporary upstream failure"))
-        upstream_failure = await client.post(
-            "/api/v1/messages",
-            headers=authorization,
-            json={"type": "text", "text": "hello"},
-        )
+        assert _error_code(await send_text("hello")) == "wechat_temporary_error"
 
-        assert blank_message.status_code == 422
-        assert blank_message.json()["detail"]["code"] == "invalid_message"
-        assert no_session.status_code == 503
-        assert no_session.json()["detail"]["code"] == "wechat_not_ready"
-        assert unbound.status_code == 409
-        assert unbound.json()["detail"]["code"] == "owner_not_bound"
-        assert missing_context.status_code == 409
-        assert missing_context.json()["detail"]["code"] == "interaction_required"
-        assert too_long.status_code == 422
-        assert too_long.json()["detail"]["code"] == "invalid_message"
-        assert upstream_failure.status_code == 502
-        assert upstream_failure.json()["detail"]["code"] == "wechat_temporary_error"
+
+async def test_mcp_transport_checks_origin_and_authenticates_other_methods(tmp_path: Path) -> None:
+    async with _running_client(tmp_path) as (client, app, gateway):
+        headers = await _authorization(app)
+        for method in ("GET", "DELETE", "PUT"):
+            assert (await client.request(method, "/mcp")).status_code == 401
+        rejected = await client.post(
+            "/mcp",
+            headers={**headers, "Origin": "https://untrusted.invalid"},
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+        assert rejected.status_code == 403
+        assert not gateway.sent
+
+
+async def test_invalid_protocol_envelope_does_not_echo_input(tmp_path: Path) -> None:
+    async with _running_client(tmp_path) as (client, app, _gateway):
+        headers = {**await _authorization(app), "Accept": "application/json, text/event-stream"}
+        invalid = await client.post("/mcp", headers=headers, json={"text": "private-notification"})
+        assert invalid.status_code == 400
+        assert invalid.json()["error"]["code"] == -32602
+        assert "private-notification" not in invalid.text
+
+
+async def test_mcp_checks_the_configured_public_host_and_origin(tmp_path: Path) -> None:
+    origin = "https://bridge.example.test:8443"
+    async with _running_client(tmp_path, mcp_public_origin=origin) as (client, app, _gateway):
+        headers = {**await _authorization(app), "Accept": "application/json, text/event-stream"}
+        rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+        ok = await client.post(f"{origin}/mcp", headers={**headers, "Origin": origin}, json=rpc)
+        assert ok.json()["result"]["tools"][0]["name"] == "send_wechat_message"
+        untrusted = await client.post("https://other.example.test/mcp", headers=headers, json=rpc)
+        assert untrusted.status_code == 421
+        foreign = await client.post(
+            f"{origin}/mcp", headers={**headers, "Origin": "https://other.example.test"}, json=rpc
+        )
+        assert foreign.status_code == 403
 
 
 async def test_removed_external_routes_are_not_available(tmp_path: Path) -> None:
@@ -408,7 +486,10 @@ async def test_removed_external_routes_are_not_available(tmp_path: Path) -> None
             headers=authorization,
         )
 
-        assert message_list.status_code == 405
+        assert (
+            await client.post("/api/v1/messages", headers=authorization, json={})
+        ).status_code == 404
+        assert message_list.status_code == 404
         assert status_route.status_code == 404
         assert recipients.status_code == 404
         assert message_lookup.status_code == 404

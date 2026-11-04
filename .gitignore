@@ -4,6 +4,7 @@
 !.env.example
 data/
 credentials.json
+settings.json
 *.db
 *.db-shm
 *.db-wal

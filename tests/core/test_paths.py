@@ -35,15 +35,19 @@ def test_frozen_windows_data_falls_back_beside_executable(tmp_path: Path) -> Non
     assert result == executable_dir / "data"
 
 
-def test_frozen_environment_file_is_beside_user_executable(
+def test_frozen_config_is_in_user_profile_and_disables_dotenv(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     executable = tmp_path / "release" / "wechat-bot-bridge.exe"
     monkeypatch.setattr(paths, "is_frozen", lambda: True)
     monkeypatch.setattr(paths.sys, "executable", str(executable))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "用户目录"))
 
-    assert paths.default_environment_file() == executable.parent / ".env"
+    assert paths.default_environment_file() is None
+    assert paths.desktop_config_file() == (
+        tmp_path / "用户目录" / "wechat-bot-bridge" / "config" / "settings.json"
+    )
 
 
 def test_source_defaults_remain_relative_to_working_directory(
@@ -55,3 +59,13 @@ def test_source_defaults_remain_relative_to_working_directory(
     assert paths.default_data_directory() == Path("data")
     assert paths.default_database_path() == Path("data/wechat-bridge.db")
     assert paths.default_credentials_path() == Path("data/wechat/credentials.json")
+
+
+@pytest.mark.parametrize("local", ["", "relative-user-dir"])
+def test_desktop_config_falls_back_to_user_profile(
+    local: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", local)
+    assert paths.desktop_config_file() == (
+        Path.home() / "AppData/Local/wechat-bot-bridge/config/settings.json"
+    )
