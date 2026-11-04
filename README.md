@@ -49,7 +49,7 @@
 
 微信 iLink Bot 是扫码账号与 Bot 的一对一私聊通道。Bridge 只向这一个已绑定账号发送通知，无法读取其他好友会话或普通微信群。长时间没有互动或遇到限频时，让扫码账号再给 Bot 发一条消息；上游的 `ret=-2` 不能单独判定具体原因。
 
-运行一个 Bridge 进程和一个 Uvicorn worker。微信只应有一个长轮询消费者，同一数据目录也只允许一个活动实例。管理页的“退出微信”会清除本机微信授权和聊天记录；正常停止服务请使用托盘“退出”或 `docker compose down`。
+运行一个 Bridge 进程和一个 Uvicorn worker。微信只应有一个长轮询消费者，同一数据目录也只允许一个活动实例。管理页的 **退出登录** 会清除本机微信授权和聊天记录。只想停止服务时，请使用托盘的 **退出** 或 `docker compose down`。
 
 ## Docker Compose 部署
 
@@ -83,12 +83,16 @@ Windows EXE 只从用户配置目录的 JSON 读取应用设置。源码开发�
 
 ## 开发与贡献
 
-项目固定使用 Python 3.12.13 和 uv。在仓库根目录运行以下命令可启动源码版。
+项目固定使用 Python 3.12.13 和 uv。开发时在仓库根目录新建 `.env` 并设置管理密码，持久数据默认写入本地 `data/`。
+
+```dotenv
+WBB_WEB_USERNAME=admin
+WBB_WEB_PASSWORD=<替换为至少 12 位的独立密码>
+```
 
 ```bash
 uv python install 3.12.13
 uv sync --frozen
-# 按 .env.example 配置管理密码；本地开发可省略 Docker 专用的路径和监听设置
 uv run wechat-bot-bridge serve
 ```
 
