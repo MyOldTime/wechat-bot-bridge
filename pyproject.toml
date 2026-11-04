@@ -20,6 +20,11 @@ dependencies = [
   "uvicorn[standard]>=0.35.0,<1",
 ]
 
+[project.urls]
+Repository = "https://github.com/MyOldTime/wechat-bot-bridge"
+Issues = "https://github.com/MyOldTime/wechat-bot-bridge/issues"
+Releases = "https://github.com/MyOldTime/wechat-bot-bridge/releases"
+
 [project.scripts]
 wechat-bot-bridge = "wechat_bot_bridge.bootstrap.cli:main"
 
